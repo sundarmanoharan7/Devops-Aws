@@ -1,0 +1,45 @@
+# .github/workflows/create-s3-bucket.yml
+name: AWS S3 Bucket Creation
+
+on:
+  workflow_dispatch: # allows manual triggers
+  push:
+    branches:
+      - main
+
+jobs:
+  create-s3-bucket:
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Configure AWS credentials
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          aws-access-key-id: ${{ secrets.AWS_ACCESS_KEY_ID }}
+          aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+          aws-region: us-east-1   # change to your desired AWS region
+
+      - name: Create S3 bucket
+        run: |
+          BUCKET_NAME=my-unique-bucket-${{ github.run_number }}
+          echo "Creating bucket: $BUCKET_NAME"
+          aws s3 mb s3://$BUCKET_NAME
+          echo "BUCKET_NAME=$BUCKET_NAME" >> $GITHUB_OUTPUT
+
+      - name: Enable versioning (optional)
+        run: |
+          BUCKET_NAME=my-unique-bucket-${{ github.run_number }}
+          aws s3api put-bucket-versioning \
+            --bucket $BUCKET_NAME \
+            --versioning-configuration Status=Enabled
+
+      - name: Block public access (optional)
+        run: |
+          BUCKET_NAME=my-unique-bucket-${{ github.run_number }}
+          aws s3api put-public-access-block \
+            --bucket $BUCKET_NAME \
+            --public-access-block-configuration \
+            "BlockPublicAcls=true,IgnorePublicAcls=true,BlockPublicPolicy=true,RestrictPublicBuckets=true"
