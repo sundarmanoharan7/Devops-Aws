@@ -1,0 +1,53 @@
+trigger:
+  - main
+
+pool:
+  vmImage: 'ubuntu-latest'
+
+variables:
+  AWS_REGION: 'us-east-1'
+  S3_BUCKET_NAME: 'my-unique-pipeline-bucket-$(Build.BuildId)'
+
+steps:
+  - checkout: self
+
+  - script: |
+      pip install awscli
+    displayName: 'Install AWS CLI'
+
+  - script: |
+      aws configure set aws_access_key_id $(AWS_ACCESS_KEY_ID)
+      aws configure set aws_secret_access_key $(AWS_SECRET_ACCESS_KEY)
+      aws configure set region $(AWS_REGION)
+    displayName: 'Configure AWS Credentials'
+    env:
+      AWS_ACCESS_KEY_ID: $(AWS_ACCESS_KEY_ID)
+      AWS_SECRET_ACCESS_KEY: $(AWS_SECRET_ACCESS_KEY)
+
+  - script: |
+      aws s3api create-bucket \
+        --bucket $(S3_BUCKET_NAME) \
+        --region $(AWS_REGION) \
+        --create-bucket-configuration LocationConstraint=$(AWS_REGION)
+    displayName: 'Create S3 Bucket'
+    condition: ne(variables['AWS_REGION'], 'us-east-1')
+
+  - script: |
+      aws s3api create-bucket \
+        --bucket $(S3_BUCKET_NAME) \
+        --region $(AWS_REGION)
+    displayName: 'Create S3 Bucket (us-east-1)'
+    condition: eq(variables['AWS_REGION'], 'us-east-1')
+
+  - script: |
+      aws s3api put-bucket-versioning \
+        --bucket $(S3_BUCKET_NAME) \
+        --versioning-configuration Status=Enabled
+    displayName: 'Enable Versioning'
+
+  - script: |
+      aws s3api put-public-access-block \
+        --bucket $(S3_BUCKET_NAME) \
+        --public-access-block-configuration \
+        "BlockPublicAcls=true,IgnorePublicAcls=true,BlockPublicPolicy=true,RestrictPublicBuckets=true"
+    displayName: 'Block Public Access'
