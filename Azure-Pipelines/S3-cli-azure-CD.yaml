@@ -6,7 +6,7 @@ pool:
 
 variables:
   AWS_REGION: 'us-east-1'
-  S3_BUCKET_NAME: 'my-unique-pipeline-bucket-$(Build.BuildId)'
+  S3_BUCKET_NAME: 'my-unique-devops-bucket-$(Build.BuildId)'
 
 steps:
   - checkout: self
