@@ -2,3 +2,4 @@ streamlit
 plotly
 fredapi
 pandas
+dbnomics
