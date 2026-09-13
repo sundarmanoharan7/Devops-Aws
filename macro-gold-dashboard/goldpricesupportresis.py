@@ -9,9 +9,20 @@ import matplotlib.pyplot as plt
 st.set_page_config(page_title="XAUUSD Multi-Timeframe Levels", layout="wide")
 st.title("Gold (XAUUSD) Multi-Timeframe Structural Levels")
 
+# --- SPOT BASIS CALIBRATION CONTROLS ---
+st.sidebar.header("Price Calibration")
+target_spot_price = st.sidebar.number_input(
+    "Target Spot Close (XAUUSD)",
+    min_value=1000.0,
+    max_value=10000.0,
+    value=4348.00,
+    step=0.50,
+    help="Anchors the COMEX futures structure to your broker's exact spot closing price."
+)
+
 # --- DATA FETCHING ---
-@st.cache_data(ttl=3600)
-def fetch_gold_data():
+@st.cache_data(ttl=1800)
+def fetch_gold_data(spot_anchor: float):
     # 1. Fetch 30 days of 1-Hour data for 1H and 4H structures
     df_1h = yf.download('GC=F', period="30d", interval='1h', progress=False)
     
@@ -22,13 +33,22 @@ def fetch_gold_data():
         st.error("Failed to fetch data from Yahoo Finance. The API might be temporarily unavailable.")
         return pd.DataFrame(), pd.DataFrame(), pd.DataFrame()
 
-    # Flatten MultiIndex columns if present (yfinance update fix)
+    # Flatten MultiIndex columns if present
     if isinstance(df_1h.columns, pd.MultiIndex):
         df_1h.columns = df_1h.columns.get_level_values(0)
     if isinstance(df_1d.columns, pd.MultiIndex):
         df_1d.columns = df_1d.columns.get_level_values(0)
 
-    # Resample 1-hour candles into 4-hour structural bars
+    # 3. Calculate basis premium (Futures Premium over Spot)
+    latest_futures_close = float(df_1h['Close'].dropna().iloc[-1])
+    basis_offset = latest_futures_close - spot_anchor
+
+    # Calibrate both hourly and daily datasets to true Spot prices
+    for col in ['Open', 'High', 'Low', 'Close']:
+        df_1h[col] = df_1h[col] - basis_offset
+        df_1d[col] = df_1d[col] - basis_offset
+
+    # 4. Resample calibrated 1-hour candles into 4-hour structural bars
     df_4h = df_1h.resample('4h').agg({
         'Open': 'first',
         'High': 'max',
@@ -61,26 +81,25 @@ def extract_key_levels(supports_all, resistances_all, live_price):
     return res_1, sup_minor, sup_maj1, sup_maj2
 
 # --- DATA PROCESSING ---
-df_1h, df_4h, df_1d = fetch_gold_data()
+df_1h, df_4h, df_1d = fetch_gold_data(target_spot_price)
 
 if not df_1h.empty and not df_1d.empty:
-    # Anchor to the latest available close
     live_price = float(df_1h['Close'].iloc[-1])
     
-    # 1. Daily Levels (Macro Trend Anchor, window=7)
+    # 1. Daily Levels (window=7)
     supports_1d, resistances_1d = find_structural_levels(df_1d, window=7)
     r1_1d, s_min_1d, s_maj1_1d, s_maj2_1d = extract_key_levels(supports_1d, resistances_1d, live_price)
 
-    # 2. 4-Hour Levels (Swing Order Blocks, window=5)
+    # 2. 4-Hour Levels (window=5)
     supports_4h, resistances_4h = find_structural_levels(df_4h, window=5)
     r1_4h, s_min_4h, s_maj1_4h, s_maj2_4h = extract_key_levels(supports_4h, resistances_4h, live_price)
     
-    # 3. 1-Hour Levels (Intraday Scalp / Entry Triggers, window=8)
+    # 3. 1-Hour Levels (window=8)
     supports_1h, resistances_1h = find_structural_levels(df_1h, window=8)
     r1_1h, s_min_1h, s_maj1_1h, s_maj2_1h = extract_key_levels(supports_1h, resistances_1h, live_price)
 
     # --- WRITTEN FORMAT DISPLAY ---
-    st.subheader(f"Live Market Price: ~${live_price:,.2f}")
+    st.subheader(f"Live Calibrated Spot Price: ~${live_price:,.2f}")
     
     col_1d, col_4h, col_1h = st.columns(3)
     
@@ -120,7 +139,7 @@ if not df_1h.empty and not df_1d.empty:
     tab_1d, tab_4h, tab_1h = st.tabs(["Daily Macro Chart", "4-Hour Swing Chart", "1-Hour Intraday Chart"])
 
     with tab_1d:
-        st.subheader("Daily Institutional Structure (1 Year)")
+        st.subheader("Daily Institutional Structure (1 Year - Spot Calibrated)")
         fig_1d, ax_1d = plt.subplots(figsize=(14, 6))
         ax_1d.plot(df_1d.index, df_1d['Close'], label='D1 Close Price', color='black', linewidth=1.5)
         
@@ -140,7 +159,7 @@ if not df_1h.empty and not df_1d.empty:
         st.pyplot(fig_1d)
 
     with tab_4h:
-        st.subheader("4-Hour Structural Chart (30 Days)")
+        st.subheader("4-Hour Structural Chart (30 Days - Spot Calibrated)")
         fig_4h, ax_4h = plt.subplots(figsize=(14, 6))
         ax_4h.plot(df_4h.index, df_4h['Close'], label='H4 Close Price', color='black', linewidth=1.5)
         
@@ -160,7 +179,7 @@ if not df_1h.empty and not df_1d.empty:
         st.pyplot(fig_4h)
 
     with tab_1h:
-        st.subheader("1-Hour Intraday Execution Chart (Last 10 Days)")
+        st.subheader("1-Hour Intraday Execution Chart (Last 10 Days - Spot Calibrated)")
         df_1h_recent = df_1h.tail(240)
         fig_1h, ax_1h = plt.subplots(figsize=(14, 6))
         ax_1h.plot(df_1h_recent.index, df_1h_recent['Close'], label='H1 Close Price', color='darkblue', linewidth=1.2)
