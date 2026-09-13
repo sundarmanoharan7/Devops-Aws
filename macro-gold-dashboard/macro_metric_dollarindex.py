@@ -10,7 +10,7 @@ FRED_API_KEY = st.secrets["FRED_API_KEY"]
 
 st.set_page_config(page_title="Institutional Gold Dashboard", layout="wide")
 st.title("Macroeconomic & Central Bank Gold Dashboard")
-st.info("System Status: v3.2 Active (Live DXY & Macro Ledger Enabled)")
+st.info("System Status: v3.3 Active (12-Month Macro Ledger Enabled)")
 
 # --- DATA FETCHING ---
 def fetch_macro_data_live():
@@ -24,7 +24,7 @@ def fetch_macro_data_live():
         inflation_yoy = ((latest_cpi - year_ago_cpi) / year_ago_cpi) * 100
         cpi_hist = cpi.pct_change(periods=12).dropna() * 100
         
-        # 2. Fetch 10-Year Treasury Yield
+        # 2. Fetch 10-Year Treasury Yield (expanded to 365 days for 12 full months)
         yield_10y_series = fred.get_series('DGS10').dropna()
         yield_10y = yield_10y_series.iloc[-1]
         
@@ -42,11 +42,11 @@ def fetch_macro_data_live():
         except Exception:
             dxy = None
             
-        # Robust fallback to live DXY spot if Yahoo rate-limits cloud runners
         if dxy is None or pd.isna(dxy):
             dxy = 98.84
         
-        return inflation_yoy, yield_10y, fed_funds, dxy, cpi_hist.tail(60), yield_10y_series.tail(180)
+        # Returned 365 days of yield history to support a 12-month table
+        return inflation_yoy, yield_10y, fed_funds, dxy, cpi_hist.tail(60), yield_10y_series.tail(365)
     except Exception as e:
         st.error(f"Error fetching macroeconomic data: {e}")
         return None, None, None, None, None, None
@@ -127,9 +127,9 @@ if inflation is not None and imf_gold_data is not None:
         st.plotly_chart(fig2, width="stretch")
         st.caption("Central Bank accumulation creates long-term structural demand.")
 
-    # --- MONTHLY MACROECONOMIC LEDGER ---
+    # --- MONTHLY MACROECONOMIC LEDGER (LAST 12 MONTHS) ---
     st.divider()
-    st.subheader("Monthly Macroeconomic Ledger (Last 6 Months)")
+    st.subheader("Monthly Macroeconomic Ledger (Last 12 Months)")
     
     cpi_df = cpi_hist.to_frame(name='CPI')
     cpi_df.index = cpi_df.index.to_period('M')
@@ -139,7 +139,9 @@ if inflation is not None and imf_gold_data is not None:
     
     macro_ledger = cpi_df.join(yield_df, how='inner').dropna()
     macro_ledger['Real Rate'] = macro_ledger['Yield'] - macro_ledger['CPI']
-    recent_macro = macro_ledger.tail(6).iloc[::-1].copy()
+    
+    # Sliced to 12 months and inverted (newest month first)
+    recent_macro = macro_ledger.tail(12).iloc[::-1].copy()
     
     macro_display = pd.DataFrame({
         'Date (Reporting Month)': recent_macro.index.strftime('%B %Y'),
