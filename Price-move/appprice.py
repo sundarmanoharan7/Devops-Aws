@@ -10,19 +10,37 @@ st.title("Gold (XAUUSD) Macro & Execution Zones")
 
 @st.cache_data(ttl=3600)
 def fetch_gold_data(period="30d"):
-    # Changed from 'GC=F' (Futures) to 'XAUUSD=X' (Spot Gold)
-    df_1h = yf.download('XAUUSD=X', period=period, interval='1h', progress=False)
+    # 1. Fetch highly reliable Futures data (GC=F)
+    df_1h = yf.download('GC=F', period=period, interval='1h', progress=False)
     
-    # Handle empty data if Yahoo Finance API fails or times out
     if df_1h.empty:
         st.error("Failed to fetch data from Yahoo Finance. The API might be down.")
         return pd.DataFrame(), pd.DataFrame()
 
-    # Flatten MultiIndex columns (yfinance update fix)
     if isinstance(df_1h.columns, pd.MultiIndex):
         df_1h.columns = df_1h.columns.get_level_values(0)
 
-    # Resample 1H data to create accurate 4H structural candles
+    # 2. Sync with Spot Market (Premium Stripping)
+    try:
+        # Daily data for XAUUSD=X works reliably on yfinance
+        spot_df = yf.download('XAUUSD=X', period='5d', interval='1d', progress=False)
+        if not spot_df.empty:
+            if isinstance(spot_df.columns, pd.MultiIndex):
+                spot_df.columns = spot_df.columns.get_level_values(0)
+            
+            latest_spot = spot_df['Close'].dropna().iloc[-1]
+            latest_futures = df_1h['Close'].dropna().iloc[-1]
+            
+            # Calculate the exact spread between Futures and Spot
+            premium = latest_futures - latest_spot
+            
+            # Adjust the futures dataset down to precisely match the spot market
+            for col in ['Open', 'High', 'Low', 'Close']:
+                df_1h[col] = df_1h[col] - premium
+    except Exception:
+        pass
+
+    # 3. Resample to 4H Structure
     df_4h = df_1h.resample('4h').agg({
         'Open': 'first', 'High': 'max', 'Low': 'min', 'Close': 'last', 'Volume': 'sum'
     }).dropna()
