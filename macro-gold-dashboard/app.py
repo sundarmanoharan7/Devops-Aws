@@ -5,7 +5,6 @@ import pandas as pd
 from dbnomics import fetch_series
 
 # --- CONFIGURATION ---
-# Fetches the key securely from Streamlit Cloud Secrets (do not hardcode it here)
 FRED_API_KEY = st.secrets["FRED_API_KEY"]
 
 st.set_page_config(page_title="Institutional Gold Dashboard", layout="wide")
@@ -36,19 +35,24 @@ def fetch_macro_data():
         st.error(f"Error fetching FRED data: {e}")
         return None, None, None, None, None
 
-@st.cache_data(ttl=86400) # Cache for 24 hours
+@st.cache_data(ttl=86400)  # Cache for 24 hours
 def fetch_imf_gold_data():
     try:
+        # Fetch World Gold Reserves from IMF IFS via DBnomics
         df_imf = fetch_series("IMF/IFS/M.W00.RAFAGOLDV_OZT")
         df_imf = df_imf[['period', 'value']].dropna()
         df_imf.rename(columns={'period': 'Date', 'value': 'Millions of Ounces'}, inplace=True)
         df_imf.set_index('Date', inplace=True)
+        
+        # Calculate Month-over-Month Net Sovereign Buying/Selling
+        df_imf['Net Change (M oz)'] = df_imf['Millions of Ounces'].diff()
+        
         return df_imf.tail(60)
     except Exception as e:
         st.error(f"Error fetching IMF data: {e}")
         return None
 
-# --- BUILD THE DASHBOARD ---
+# --- LOAD DATA ---
 st.write("Fetching live institutional data from FRED and the IMF...")
 inflation, yield_10y, fed_funds, cpi_hist, yield_hist = fetch_macro_data()
 imf_gold_data = fetch_imf_gold_data()
@@ -83,7 +87,7 @@ if inflation is not None and imf_gold_data is not None:
     
     st.divider()
     
-    # --- BOTTOM SECTION: VISUAL CHARTS ---
+    # --- BOTTOM SECTION: VISUAL CHARTS & BREAKDOWN ---
     chart_col1, chart_col2 = st.columns(2)
     
     with chart_col1:
@@ -104,3 +108,28 @@ if inflation is not None and imf_gold_data is not None:
         fig2.update_layout(height=400, template="plotly_white", margin=dict(l=0, r=0, t=30, b=0))
         st.plotly_chart(fig2, use_container_width=True)
         st.caption("Central Bank accumulation absorbs macro selling pressure.")
+
+    # --- MONTHLY SOVEREIGN ACCUMULATION LEDGER ---
+    st.divider()
+    st.subheader("Monthly Sovereign Net Accumulation Ledger")
+    
+    # Prepare the most recent reporting months
+    recent_ledger = imf_gold_data.tail(6).copy()
+    
+    # Format strings for clean presentation
+    recent_ledger['Formatted Reserves'] = recent_ledger['Millions of Ounces'].apply(lambda x: f"{x:,.2f}")
+    recent_ledger['Formatted Net Change'] = recent_ledger['Net Change (M oz)'].apply(
+        lambda x: f"+ {x:.2f}M oz" if x > 0 else (f"- {abs(x):.2f}M oz" if x < 0 else "0.00M oz")
+    )
+    
+    # Reorganize and rename columns for display
+    display_df = recent_ledger[['Formatted Reserves', 'Formatted Net Change']].reset_index()
+    display_df.rename(columns={
+        'Date': 'Date (Reporting Lag)',
+        'Formatted Reserves': 'Global Reserves (Millions of Troy Ounces)',
+        'Formatted Net Change': 'Net Change'
+    }, inplace=True)
+    
+    # Render table in reverse chronological order (newest month first)
+    st.dataframe(display_df.iloc[::-1], use_container_width=True, hide_index=True)
+    st.caption("Data reflects official IMF IFS reporting. Monthly lag is typically 30-60 days.")
