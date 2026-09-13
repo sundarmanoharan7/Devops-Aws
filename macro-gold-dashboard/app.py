@@ -42,12 +42,16 @@ def fetch_imf_gold_data():
         df_imf = fetch_series("IMF/IFS/M.W00.RAFAGOLDV_OZT")
         df_imf = df_imf[['period', 'value']].dropna()
         df_imf.rename(columns={'period': 'Date', 'value': 'Millions of Ounces'}, inplace=True)
+        
+        # Ensure Date is parsed as datetime
+        df_imf['Date'] = pd.to_datetime(df_imf['Date'])
         df_imf.set_index('Date', inplace=True)
+        df_imf.sort_index(inplace=True)
         
         # Calculate Month-over-Month Net Sovereign Buying/Selling
         df_imf['Net Change (M oz)'] = df_imf['Millions of Ounces'].diff()
         
-        return df_imf.tail(60)
+        return df_imf
     except Exception as e:
         st.error(f"Error fetching IMF data: {e}")
         return None
@@ -87,7 +91,7 @@ if inflation is not None and imf_gold_data is not None:
     
     st.divider()
     
-    # --- BOTTOM SECTION: VISUAL CHARTS & BREAKDOWN ---
+    # --- BOTTOM SECTION: VISUAL CHARTS ---
     chart_col1, chart_col2 = st.columns(2)
     
     with chart_col1:
@@ -101,35 +105,49 @@ if inflation is not None and imf_gold_data is not None:
         
     with chart_col2:
         st.subheader("The Institutional Price Floor")
+        imf_chart_data = imf_gold_data.tail(60).copy()
         fig2 = go.Figure()
-        fig2.add_trace(go.Bar(x=imf_gold_data.index, y=imf_gold_data['Millions of Ounces'], name="Reserves", marker_color='gold'))
-        imf_gold_data['Trend'] = imf_gold_data['Millions of Ounces'].rolling(window=3).mean()
-        fig2.add_trace(go.Scatter(x=imf_gold_data.index, y=imf_gold_data['Trend'], name="Trend", line=dict(color='black', width=2)))
+        fig2.add_trace(go.Bar(x=imf_chart_data.index, y=imf_chart_data['Millions of Ounces'], name="Reserves", marker_color='gold'))
+        imf_chart_data['Trend'] = imf_chart_data['Millions of Ounces'].rolling(window=3).mean()
+        fig2.add_trace(go.Scatter(x=imf_chart_data.index, y=imf_chart_data['Trend'], name="Trend", line=dict(color='black', width=2)))
         fig2.update_layout(height=400, template="plotly_white", margin=dict(l=0, r=0, t=30, b=0))
         st.plotly_chart(fig2, use_container_width=True)
         st.caption("Central Bank accumulation absorbs macro selling pressure.")
 
-    # --- MONTHLY SOVEREIGN ACCUMULATION LEDGER ---
+    # --- MONTHLY SOVEREIGN ACCUMULATION LEDGER (CURRENT YEAR) ---
     st.divider()
-    st.subheader("Monthly Sovereign Net Accumulation Ledger")
     
-    # Prepare the most recent reporting months
-    recent_ledger = imf_gold_data.tail(6).copy()
+    # Filter for the current year dynamically
+    current_year = pd.Timestamp.now().year
+    current_year_ledger = imf_gold_data[imf_gold_data.index.year == current_year].copy()
     
-    # Format strings for clean presentation
-    recent_ledger['Formatted Reserves'] = recent_ledger['Millions of Ounces'].apply(lambda x: f"{x:,.2f}")
-    recent_ledger['Formatted Net Change'] = recent_ledger['Net Change (M oz)'].apply(
+    # Fallback to the latest available year if current year has no data yet due to IMF reporting lag
+    display_year = current_year
+    if current_year_ledger.empty:
+        display_year = imf_gold_data.index.year.max()
+        current_year_ledger = imf_gold_data[imf_gold_data.index.year == display_year].copy()
+        st.info(f"Official IMF figures for {current_year} are pending publication due to reporting lag. Showing data for {display_year}.")
+
+    st.subheader(f"Monthly Sovereign Net Accumulation Ledger ({display_year})")
+
+    # Format values for table display
+    current_year_ledger['Date (Reporting Lag)'] = current_year_ledger.index.strftime('%B %Y')
+    current_year_ledger['Global Reserves (Millions of Troy Ounces)'] = current_year_ledger['Millions of Ounces'].apply(lambda x: f"{x:,.2f}")
+    current_year_ledger['Net Change'] = current_year_ledger['Net Change (M oz)'].apply(
         lambda x: f"+ {x:.2f}M oz" if x > 0 else (f"- {abs(x):.2f}M oz" if x < 0 else "0.00M oz")
     )
     
-    # Reorganize and rename columns for display
-    display_df = recent_ledger[['Formatted Reserves', 'Formatted Net Change']].reset_index()
-    display_df.rename(columns={
-        'Date': 'Date (Reporting Lag)',
-        'Formatted Reserves': 'Global Reserves (Millions of Troy Ounces)',
-        'Formatted Net Change': 'Net Change'
-    }, inplace=True)
+    # Display Year-to-Date (YTD) Net Accumulation metric
+    ytd_net = current_year_ledger['Net Change (M oz)'].sum()
+    ytd_sign = "+" if ytd_net > 0 else ""
+    st.metric(
+        label=f"{display_year} Year-to-Date Net Accumulation",
+        value=f"{ytd_sign}{ytd_net:.2f}M oz",
+        delta=f"{ytd_sign}{ytd_net:.2f}M oz vs Prior Year End"
+    )
     
-    # Render table in reverse chronological order (newest month first)
-    st.dataframe(display_df.iloc[::-1], use_container_width=True, hide_index=True)
-    st.caption("Data reflects official IMF IFS reporting. Monthly lag is typically 30-60 days.")
+    # Build clean output DataFrame (sorted newest month first)
+    display_df = current_year_ledger[['Date (Reporting Lag)', 'Global Reserves (Millions of Troy Ounces)', 'Net Change']].iloc[::-1]
+    
+    st.dataframe(display_df, use_container_width=True, hide_index=True)
+    st.caption("Data source: International Monetary Fund (IMF IFS). New reporting points are updated monthly.")
