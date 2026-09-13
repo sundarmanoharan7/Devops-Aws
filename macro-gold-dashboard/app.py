@@ -114,40 +114,36 @@ if inflation is not None and imf_gold_data is not None:
         st.plotly_chart(fig2, use_container_width=True)
         st.caption("Central Bank accumulation absorbs macro selling pressure.")
 
-    # --- MONTHLY SOVEREIGN ACCUMULATION LEDGER (CURRENT YEAR) ---
+# --- MONTHLY SOVEREIGN ACCUMULATION LEDGER (TRAILING 12 MONTHS) ---
     st.divider()
     
-    # Filter for the current year dynamically
-    current_year = pd.Timestamp.now().year
-    current_year_ledger = imf_gold_data[imf_gold_data.index.year == current_year].copy()
+    # Always grab the 12 most recent monthly prints, regardless of calendar year crossover
+    ttm_ledger = imf_gold_data.tail(12).copy()
     
-    # Fallback to the latest available year if current year has no data yet due to IMF reporting lag
-    display_year = current_year
-    if current_year_ledger.empty:
-        display_year = imf_gold_data.index.year.max()
-        current_year_ledger = imf_gold_data[imf_gold_data.index.year == display_year].copy()
-        st.info(f"Official IMF figures for {current_year} are pending publication due to reporting lag. Showing data for {display_year}.")
-
-    st.subheader(f"Monthly Sovereign Net Accumulation Ledger ({display_year})")
+    # Get the date range for the header
+    start_month = ttm_ledger.index.min().strftime('%b %Y')
+    end_month = ttm_ledger.index.max().strftime('%b %Y')
+    
+    st.subheader(f"Monthly Sovereign Net Accumulation Ledger ({start_month} – {end_month})")
 
     # Format values for table display
-    current_year_ledger['Date (Reporting Lag)'] = current_year_ledger.index.strftime('%B %Y')
-    current_year_ledger['Global Reserves (Millions of Troy Ounces)'] = current_year_ledger['Millions of Ounces'].apply(lambda x: f"{x:,.2f}")
-    current_year_ledger['Net Change'] = current_year_ledger['Net Change (M oz)'].apply(
-        lambda x: f"+ {x:.2f}M oz" if x > 0 else (f"- {abs(x):.2f}M oz" if x < 0 else "0.00M oz")
+    ttm_ledger['Date (Reporting Lag)'] = ttm_ledger.index.strftime('%B %Y')
+    ttm_ledger['Global Reserves (Millions of Troy Ounces)'] = ttm_ledger['Millions of Ounces'].apply(lambda x: f"{x:,.2f}")
+    ttm_ledger['Net Change'] = ttm_ledger['Net Change (M oz)'].apply(
+        lambda x: f"+ {x:.2f}M oz" if pd.notnull(x) and x > 0 else (f"- {abs(x):.2f}M oz" if pd.notnull(x) and x < 0 else "0.00M oz")
     )
     
-    # Display Year-to-Date (YTD) Net Accumulation metric
-    ytd_net = current_year_ledger['Net Change (M oz)'].sum()
+    # Display Trailing 12-Month (TTM) Net Accumulation metric
+    ytd_net = ttm_ledger['Net Change (M oz)'].sum()
     ytd_sign = "+" if ytd_net > 0 else ""
     st.metric(
-        label=f"{display_year} Year-to-Date Net Accumulation",
+        label=f"Trailing 12-Month Net Accumulation",
         value=f"{ytd_sign}{ytd_net:.2f}M oz",
-        delta=f"{ytd_sign}{ytd_net:.2f}M oz vs Prior Year End"
+        delta=f"Total sovereign accumulation over the last 12 reported months"
     )
     
     # Build clean output DataFrame (sorted newest month first)
-    display_df = current_year_ledger[['Date (Reporting Lag)', 'Global Reserves (Millions of Troy Ounces)', 'Net Change']].iloc[::-1]
+    display_df = ttm_ledger[['Date (Reporting Lag)', 'Global Reserves (Millions of Troy Ounces)', 'Net Change']].iloc[::-1]
     
     st.dataframe(display_df, use_container_width=True, hide_index=True)
-    st.caption("Data source: International Monetary Fund (IMF IFS). New reporting points are updated monthly.")
+    st.caption("Data source: International Monetary Fund (IMF IFS). Displays the latest 12 months of available reporting.")
