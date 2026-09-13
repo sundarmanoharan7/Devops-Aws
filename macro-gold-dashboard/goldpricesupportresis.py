@@ -23,8 +23,8 @@ target_spot_price = st.sidebar.number_input(
 # --- DATA FETCHING ---
 @st.cache_data(ttl=1800)
 def fetch_gold_data(spot_anchor: float):
-    # 1. Fetch 30 days of 1-Hour data for 1H and 4H structures
-    df_1h = yf.download('GC=F', period="30d", interval='1h', progress=False)
+    # 1. Fetch 90 days of 1-Hour data for 1H and 4H structures (Yahoo Finance allows 1h data up to 730 days)
+    df_1h = yf.download('GC=F', period="90d", interval='1h', progress=False)
     
     # 2. Fetch 1 Year of Daily data for macro D1 structure
     df_1d = yf.download('GC=F', period="1y", interval='1d', progress=False)
@@ -159,7 +159,7 @@ if not df_1h.empty and not df_1d.empty:
         st.pyplot(fig_1d)
 
     with tab_4h:
-        st.subheader("4-Hour Structural Chart (30 Days - Spot Calibrated)")
+        st.subheader("4-Hour Structural Chart (90 Days - Spot Calibrated)")
         fig_4h, ax_4h = plt.subplots(figsize=(14, 6))
         ax_4h.plot(df_4h.index, df_4h['Close'], label='H4 Close Price', color='black', linewidth=1.5)
         
@@ -179,10 +179,9 @@ if not df_1h.empty and not df_1d.empty:
         st.pyplot(fig_4h)
 
     with tab_1h:
-        st.subheader("1-Hour Intraday Execution Chart (Last 10 Days - Spot Calibrated)")
-        df_1h_recent = df_1h.tail(240)
+        st.subheader("1-Hour Intraday Execution Chart (90 Days - Spot Calibrated)")
         fig_1h, ax_1h = plt.subplots(figsize=(14, 6))
-        ax_1h.plot(df_1h_recent.index, df_1h_recent['Close'], label='H1 Close Price', color='darkblue', linewidth=1.2)
+        ax_1h.plot(df_1h.index, df_1h['Close'], label='H1 Close Price', color='darkblue', linewidth=1.2)
         
         if r1_1h:
             ax_1h.axhline(r1_1h, color='red', linestyle='--', alpha=0.85, linewidth=2, label=f'H1 Supply (${r1_1h:,.2f})')
