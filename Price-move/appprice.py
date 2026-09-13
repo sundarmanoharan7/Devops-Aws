@@ -10,7 +10,7 @@ st.title("Gold (XAUUSD) Macro & Execution Zones")
 
 @st.cache_data(ttl=3600)
 def fetch_gold_data(period="30d"):
-    # 1. Fetch highly reliable Futures data (GC=F)
+    # 1. Fetch highly reliable structural data (GC=F)
     df_1h = yf.download('GC=F', period=period, interval='1h', progress=False)
     
     if df_1h.empty:
@@ -20,25 +20,15 @@ def fetch_gold_data(period="30d"):
     if isinstance(df_1h.columns, pd.MultiIndex):
         df_1h.columns = df_1h.columns.get_level_values(0)
 
-    # 2. Sync with Spot Market (Premium Stripping)
-    try:
-        # Daily data for XAUUSD=X works reliably on yfinance
-        spot_df = yf.download('XAUUSD=X', period='5d', interval='1d', progress=False)
-        if not spot_df.empty:
-            if isinstance(spot_df.columns, pd.MultiIndex):
-                spot_df.columns = spot_df.columns.get_level_values(0)
-            
-            latest_spot = spot_df['Close'].dropna().iloc[-1]
-            latest_futures = df_1h['Close'].dropna().iloc[-1]
-            
-            # Calculate the exact spread between Futures and Spot
-            premium = latest_futures - latest_spot
-            
-            # Adjust the futures dataset down to precisely match the spot market
-            for col in ['Open', 'High', 'Low', 'Close']:
-                df_1h[col] = df_1h[col] - premium
-    except Exception:
-        pass
+    # 2. Direct Mathematical Anchor to your exact Spot Price
+    broker_spot_price = 4348.00  # The exact closing price you want to anchor to
+    
+    latest_close = df_1h['Close'].dropna().iloc[-1]
+    premium_offset = latest_close - broker_spot_price
+    
+    # Shift all price columns down by the exact offset
+    for col in ['Open', 'High', 'Low', 'Close']:
+        df_1h[col] = df_1h[col] - premium_offset
 
     # 3. Resample to 4H Structure
     df_4h = df_1h.resample('4h').agg({
@@ -46,7 +36,6 @@ def fetch_gold_data(period="30d"):
     }).dropna()
     
     return df_1h, df_4h
-
 def find_structural_levels(df, window):
     maxima_indices = argrelextrema(df['High'].values, np.greater, order=window)[0]
     resistances = df['High'].iloc[maxima_indices].values
