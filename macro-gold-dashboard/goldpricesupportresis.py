@@ -11,16 +11,22 @@ st.title("Gold (XAUUSD) Multi-Timeframe Structural Levels")
 
 # --- DATA FETCHING ---
 @st.cache_data(ttl=3600)
-def fetch_gold_data(period="30d"):
-    df_1h = yf.download('GC=F', period=period, interval='1h', progress=False)
+def fetch_gold_data():
+    # 1. Fetch 30 days of 1-Hour data for 1H and 4H structures
+    df_1h = yf.download('GC=F', period="30d", interval='1h', progress=False)
     
-    if df_1h.empty:
-        st.error("Failed to fetch data from Yahoo Finance. The API might be down.")
-        return pd.DataFrame(), pd.DataFrame()
+    # 2. Fetch 1 Year of Daily data for macro D1 structure
+    df_1d = yf.download('GC=F', period="1y", interval='1d', progress=False)
+    
+    if df_1h.empty or df_1d.empty:
+        st.error("Failed to fetch data from Yahoo Finance. The API might be temporarily unavailable.")
+        return pd.DataFrame(), pd.DataFrame(), pd.DataFrame()
 
-    # Flatten MultiIndex columns if present
+    # Flatten MultiIndex columns if present (yfinance update fix)
     if isinstance(df_1h.columns, pd.MultiIndex):
         df_1h.columns = df_1h.columns.get_level_values(0)
+    if isinstance(df_1d.columns, pd.MultiIndex):
+        df_1d.columns = df_1d.columns.get_level_values(0)
 
     # Resample 1-hour candles into 4-hour structural bars
     df_4h = df_1h.resample('4h').agg({
@@ -31,7 +37,7 @@ def fetch_gold_data(period="30d"):
         'Volume': 'sum'
     }).dropna()
     
-    return df_1h, df_4h
+    return df_1h, df_4h, df_1d
 
 # --- LEVEL DETECTION ---
 def find_structural_levels(df, window=5):
@@ -55,27 +61,41 @@ def extract_key_levels(supports_all, resistances_all, live_price):
     return res_1, sup_minor, sup_maj1, sup_maj2
 
 # --- DATA PROCESSING ---
-df_1h, df_4h = fetch_gold_data()
+df_1h, df_4h, df_1d = fetch_gold_data()
 
-if not df_1h.empty:
-    # Latest close price
+if not df_1h.empty and not df_1d.empty:
+    # Anchor to the latest available close
     live_price = float(df_1h['Close'].iloc[-1])
     
-    # Calculate 4-Hour Levels (Macro)
+    # 1. Daily Levels (Macro Trend Anchor, window=7)
+    supports_1d, resistances_1d = find_structural_levels(df_1d, window=7)
+    r1_1d, s_min_1d, s_maj1_1d, s_maj2_1d = extract_key_levels(supports_1d, resistances_1d, live_price)
+
+    # 2. 4-Hour Levels (Swing Order Blocks, window=5)
     supports_4h, resistances_4h = find_structural_levels(df_4h, window=5)
     r1_4h, s_min_4h, s_maj1_4h, s_maj2_4h = extract_key_levels(supports_4h, resistances_4h, live_price)
     
-    # Calculate 1-Hour Levels (Intraday Execution) - using window=8 to capture clear swing pivots
+    # 3. 1-Hour Levels (Intraday Scalp / Entry Triggers, window=8)
     supports_1h, resistances_1h = find_structural_levels(df_1h, window=8)
     r1_1h, s_min_1h, s_maj1_1h, s_maj2_1h = extract_key_levels(supports_1h, resistances_1h, live_price)
 
     # --- WRITTEN FORMAT DISPLAY ---
-    st.subheader(f"Live Spot / Futures Price: ~${live_price:,.2f}")
+    st.subheader(f"Live Market Price: ~${live_price:,.2f}")
     
-    col_4h, col_1h = st.columns(2)
+    col_1d, col_4h, col_1h = st.columns(3)
     
+    with col_1d:
+        st.markdown("### Daily (D1) Macro")
+        st.markdown("**Resistance (Supply Zones)**")
+        st.write(f"1st Resistance Point: ${r1_1d:,.2f}" if r1_1d else "1st Resistance Point: N/A")
+        
+        st.markdown("**Support (Demand Zones)**")
+        st.write(f"Minor Support: ${s_min_1d:,.2f}" if s_min_1d else "Minor Support: N/A")
+        st.write(f"Major Support 1: ${s_maj1_1d:,.2f}" if s_maj1_1d else "Major Support 1: N/A")
+        st.write(f"Major Support 2: ${s_maj2_1d:,.2f}" if s_maj2_1d else "Major Support 2: N/A")
+
     with col_4h:
-        st.markdown("### 4-Hour Macro Structure")
+        st.markdown("### 4-Hour (4H) Swing")
         st.markdown("**Resistance (Supply Zones)**")
         st.write(f"1st Resistance Point: ${r1_4h:,.2f}" if r1_4h else "1st Resistance Point: N/A")
         
@@ -85,7 +105,7 @@ if not df_1h.empty:
         st.write(f"Major Support 2: ${s_maj2_4h:,.2f}" if s_maj2_4h else "Major Support 2: N/A")
 
     with col_1h:
-        st.markdown("### 1-Hour Intraday Structure")
+        st.markdown("### 1-Hour (1H) Intraday")
         st.markdown("**Resistance (Supply Zones)**")
         st.write(f"1st Resistance Point: ${r1_1h:,.2f}" if r1_1h else "1st Resistance Point: N/A")
         
@@ -97,10 +117,30 @@ if not df_1h.empty:
     st.divider()
 
     # --- CHART VISUALIZATION (TABS) ---
-    tab_4h, tab_1h = st.tabs(["4-Hour Macro Chart", "1-Hour Intraday Chart"])
+    tab_1d, tab_4h, tab_1h = st.tabs(["Daily Macro Chart", "4-Hour Swing Chart", "1-Hour Intraday Chart"])
+
+    with tab_1d:
+        st.subheader("Daily Institutional Structure (1 Year)")
+        fig_1d, ax_1d = plt.subplots(figsize=(14, 6))
+        ax_1d.plot(df_1d.index, df_1d['Close'], label='D1 Close Price', color='black', linewidth=1.5)
+        
+        if r1_1d:
+            ax_1d.axhline(r1_1d, color='red', linestyle='--', alpha=0.85, linewidth=2, label=f'D1 Supply (${r1_1d:,.2f})')
+        if s_min_1d:
+            ax_1d.axhline(s_min_1d, color='lightgreen', linestyle='--', alpha=0.9, linewidth=1.5, label=f'D1 Minor Demand (${s_min_1d:,.2f})')
+        if s_maj1_1d:
+            ax_1d.axhline(s_maj1_1d, color='green', linestyle='-', alpha=0.75, linewidth=2, label=f'D1 Major Demand 1 (${s_maj1_1d:,.2f})')
+        if s_maj2_1d:
+            ax_1d.axhline(s_maj2_1d, color='darkgreen', linestyle='-', alpha=0.9, linewidth=2.5, label=f'D1 Major Demand 2 (${s_maj2_1d:,.2f})')
+        
+        ax_1d.set_title('XAUUSD Daily Macro Structure')
+        ax_1d.set_ylabel('Price (USD)')
+        ax_1d.legend(loc='upper left', bbox_to_anchor=(1, 1))
+        ax_1d.grid(alpha=0.2)
+        st.pyplot(fig_1d)
 
     with tab_4h:
-        st.subheader("4-Hour Structural Chart")
+        st.subheader("4-Hour Structural Chart (30 Days)")
         fig_4h, ax_4h = plt.subplots(figsize=(14, 6))
         ax_4h.plot(df_4h.index, df_4h['Close'], label='H4 Close Price', color='black', linewidth=1.5)
         
@@ -121,7 +161,6 @@ if not df_1h.empty:
 
     with tab_1h:
         st.subheader("1-Hour Intraday Execution Chart (Last 10 Days)")
-        # Filter 1H chart to last 10 days for clarity
         df_1h_recent = df_1h.tail(240)
         fig_1h, ax_1h = plt.subplots(figsize=(14, 6))
         ax_1h.plot(df_1h_recent.index, df_1h_recent['Close'], label='H1 Close Price', color='darkblue', linewidth=1.2)
