@@ -10,7 +10,8 @@ st.title("Gold (XAUUSD) Macro & Execution Zones")
 
 @st.cache_data(ttl=3600)
 def fetch_gold_data(period="30d"):
-    df_1h = yf.download('GC=F', period=period, interval='1h', progress=False)
+    # Changed from 'GC=F' (Futures) to 'XAUUSD=X' (Spot Gold)
+    df_1h = yf.download('XAUUSD=X', period=period, interval='1h', progress=False)
     
     # Handle empty data if Yahoo Finance API fails or times out
     if df_1h.empty:
