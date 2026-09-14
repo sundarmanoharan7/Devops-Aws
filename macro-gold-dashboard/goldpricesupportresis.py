@@ -4,13 +4,14 @@ import pandas as pd
 import numpy as np
 from scipy.signal import argrelextrema
 import matplotlib.pyplot as plt
+import matplotlib.dates as mdates
 
 # --- PAGE CONFIG ---
 st.set_page_config(page_title="XAUUSD Multi-Timeframe Levels", layout="wide")
 st.title("Gold (XAUUSD) Multi-Timeframe Structural Levels")
 
 # --- SPOT BASIS CALIBRATION CONTROLS ---
-st.sidebar.header("Price Calibration")
+st.sidebar.header("Price & Session Settings")
 target_spot_price = st.sidebar.number_input(
     "Target Spot Close (XAUUSD)",
     min_value=1000.0,
@@ -20,13 +21,21 @@ target_spot_price = st.sidebar.number_input(
     help="Anchors the COMEX futures structure to your broker's exact spot closing price."
 )
 
+h1_view_days = st.sidebar.slider(
+    "1-Hour Chart Lookback (Days)",
+    min_value=3,
+    max_value=90,
+    value=7,
+    help="Zoom in on recent days to see session overlap shading clearly."
+)
+
 # --- DATA FETCHING ---
 @st.cache_data(ttl=1800)
 def fetch_gold_data(spot_anchor: float):
-    # 1. Fetch 90 days of 1-Hour data for 1H and 4H structures (Yahoo Finance allows 1h data up to 730 days)
+    # Fetch 90 days of 1-Hour data for 1H and 4H structures
     df_1h = yf.download('GC=F', period="90d", interval='1h', progress=False)
     
-    # 2. Fetch 1 Year of Daily data for macro D1 structure
+    # Fetch 1 Year of Daily data for macro D1 structure
     df_1d = yf.download('GC=F', period="1y", interval='1d', progress=False)
     
     if df_1h.empty or df_1d.empty:
@@ -39,16 +48,27 @@ def fetch_gold_data(spot_anchor: float):
     if isinstance(df_1d.columns, pd.MultiIndex):
         df_1d.columns = df_1d.columns.get_level_values(0)
 
-    # 3. Calculate basis premium (Futures Premium over Spot)
+    # Standardize datetime index to UTC
+    if df_1h.index.tz is None:
+        df_1h.index = df_1h.index.tz_localize('UTC')
+    else:
+        df_1h.index = df_1h.index.tz_convert('UTC')
+
+    if df_1d.index.tz is None:
+        df_1d.index = df_1d.index.tz_localize('UTC')
+    else:
+        df_1d.index = df_1d.index.tz_convert('UTC')
+
+    # Calculate basis premium (Futures Premium over Spot)
     latest_futures_close = float(df_1h['Close'].dropna().iloc[-1])
     basis_offset = latest_futures_close - spot_anchor
 
-    # Calibrate both hourly and daily datasets to true Spot prices
+    # Calibrate datasets to true Spot prices
     for col in ['Open', 'High', 'Low', 'Close']:
         df_1h[col] = df_1h[col] - basis_offset
         df_1d[col] = df_1d[col] - basis_offset
 
-    # 4. Resample calibrated 1-hour candles into 4-hour structural bars
+    # Resample calibrated 1-hour candles into 4-hour structural bars
     df_4h = df_1h.resample('4h').agg({
         'Open': 'first',
         'High': 'max',
@@ -80,6 +100,23 @@ def extract_key_levels(supports_all, resistances_all, live_price):
     
     return res_1, sup_minor, sup_maj1, sup_maj2
 
+# --- SESSION OVERLAP SHADING HELPER ---
+def shade_london_ny_overlap(ax, df_subset):
+    """Shades London & New York session overlap (12:00 to 16:00 UTC)"""
+    unique_dates = sorted(list(set(df_subset.index.date)))
+    shaded_label_added = False
+    
+    for day in unique_dates:
+        # Define start and end of overlap window in UTC
+        session_start = pd.Timestamp(day, tz='UTC') + pd.Timedelta(hours=12)
+        session_end = pd.Timestamp(day, tz='UTC') + pd.Timedelta(hours=16)
+        
+        # Only shade if within subset boundaries
+        if session_end >= df_subset.index.min() and session_start <= df_subset.index.max():
+            lbl = "London/NY Overlap (Peak Volume)" if not shaded_label_added else ""
+            ax.axvspan(session_start, session_end, color='goldenrod', alpha=0.18, label=lbl)
+            shaded_label_added = True
+
 # --- DATA PROCESSING ---
 df_1h, df_4h, df_1d = fetch_gold_data(target_spot_price)
 
@@ -107,7 +144,6 @@ if not df_1h.empty and not df_1d.empty:
         st.markdown("### Daily (D1) Macro")
         st.markdown("**Resistance (Supply Zones)**")
         st.write(f"1st Resistance Point: ${r1_1d:,.2f}" if r1_1d else "1st Resistance Point: N/A")
-        
         st.markdown("**Support (Demand Zones)**")
         st.write(f"Minor Support: ${s_min_1d:,.2f}" if s_min_1d else "Minor Support: N/A")
         st.write(f"Major Support 1: ${s_maj1_1d:,.2f}" if s_maj1_1d else "Major Support 1: N/A")
@@ -117,7 +153,6 @@ if not df_1h.empty and not df_1d.empty:
         st.markdown("### 4-Hour (4H) Swing")
         st.markdown("**Resistance (Supply Zones)**")
         st.write(f"1st Resistance Point: ${r1_4h:,.2f}" if r1_4h else "1st Resistance Point: N/A")
-        
         st.markdown("**Support (Demand Zones)**")
         st.write(f"Minor Support: ${s_min_4h:,.2f}" if s_min_4h else "Minor Support: N/A")
         st.write(f"Major Support 1: ${s_maj1_4h:,.2f}" if s_maj1_4h else "Major Support 1: N/A")
@@ -127,7 +162,6 @@ if not df_1h.empty and not df_1d.empty:
         st.markdown("### 1-Hour (1H) Intraday")
         st.markdown("**Resistance (Supply Zones)**")
         st.write(f"1st Resistance Point: ${r1_1h:,.2f}" if r1_1h else "1st Resistance Point: N/A")
-        
         st.markdown("**Support (Demand Zones)**")
         st.write(f"Minor Support: ${s_min_1h:,.2f}" if s_min_1h else "Minor Support: N/A")
         st.write(f"Major Support 1: ${s_maj1_1h:,.2f}" if s_maj1_1h else "Major Support 1: N/A")
@@ -179,10 +213,21 @@ if not df_1h.empty and not df_1d.empty:
         st.pyplot(fig_4h)
 
     with tab_1h:
-        st.subheader("1-Hour Intraday Execution Chart (90 Days - Spot Calibrated)")
-        fig_1h, ax_1h = plt.subplots(figsize=(14, 6))
-        ax_1h.plot(df_1h.index, df_1h['Close'], label='H1 Close Price', color='darkblue', linewidth=1.2)
+        st.subheader(f"1-Hour Intraday Chart (Last {h1_view_days} Days - Session Highlighted)")
         
+        # Filter 1H dataset based on sidebar slider for clear inspection
+        cutoff_date = df_1h.index.max() - pd.Timedelta(days=h1_view_days)
+        df_1h_view = df_1h[df_1h.index >= cutoff_date]
+        
+        fig_1h, ax_1h = plt.subplots(figsize=(14, 6))
+        
+        # 1. Overlay Institutional Session Shading (London/NY Overlap)
+        shade_london_ny_overlap(ax_1h, df_1h_view)
+        
+        # 2. Plot Price
+        ax_1h.plot(df_1h_view.index, df_1h_view['Close'], label='H1 Close Price', color='navy', linewidth=1.4)
+        
+        # 3. Horizontal Support & Resistance Levels
         if r1_1h:
             ax_1h.axhline(r1_1h, color='red', linestyle='--', alpha=0.85, linewidth=2, label=f'H1 Supply (${r1_1h:,.2f})')
         if s_min_1h:
@@ -192,8 +237,12 @@ if not df_1h.empty and not df_1d.empty:
         if s_maj2_1h:
             ax_1h.axhline(s_maj2_1h, color='darkgreen', linestyle='-', alpha=0.9, linewidth=2.5, label=f'H1 Major Demand 2 (${s_maj2_1h:,.2f})')
         
-        ax_1h.set_title('XAUUSD 1-Hour Intraday Structure')
+        # Format X-axis dates clearly
+        ax_1h.xaxis.set_major_formatter(mdates.DateFormatter('%b %d\n%H:%M UTC'))
+        
+        ax_1h.set_title('XAUUSD 1-Hour Intraday Structure with Session Overlap')
         ax_1h.set_ylabel('Price (USD)')
         ax_1h.legend(loc='upper left', bbox_to_anchor=(1, 1))
         ax_1h.grid(alpha=0.2)
         st.pyplot(fig_1h)
+        st.caption("Golden bands indicate the London & New York Session Overlap (12:00 – 16:00 UTC), representing the highest probability execution windows.")
