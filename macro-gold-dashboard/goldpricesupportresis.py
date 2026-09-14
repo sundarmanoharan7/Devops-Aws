@@ -46,18 +46,18 @@ live_spot_input = st.sidebar.number_input(
     help="Synchronizes chart candles and support/resistance zones to your exact broker/TradingView feed."
 )
 
-# Set default to 30 days lookback
+# Set default to 20 days lookback
 h1_view_days = st.sidebar.slider(
     "1-Hour Chart Lookback (Days)",
     min_value=3,
     max_value=60,
-    value=30,
+    value=20,
     help="Adjust zoom level on recent session developments."
 )
 
 @st.cache_data(ttl=120)
 def fetch_and_align_market_data(anchor_spot: float):
-    # Fetch 60 days of 1-Hour data (safely covers the 30-day window)
+    # Fetch 60 days of 1-Hour data (safely covers the 20-day window)
     df_1h = yf.download('GC=F', period="60d", interval='1h', progress=False)
     df_1d = yf.download('GC=F', period="1y", interval='1d', progress=False)
     
@@ -219,12 +219,9 @@ if not df_1h.empty and not df_1d.empty:
         if s_maj1_1h: ax_1h.axhline(s_maj1_1h, color='green', linestyle='-', alpha=0.75, label=f'H1 Demand 1 (${s_maj1_1h:,.2f})')
         if s_maj2_1h: ax_1h.axhline(s_maj2_1h, color='darkgreen', linestyle='-', alpha=0.9, label=f'H1 Demand 2 (${s_maj2_1h:,.2f})')
         
-        # Clean formatting: for multi-week views (>10 days), format by date to avoid tick crowding
-        if h1_view_days > 10:
-            ax_1h.xaxis.set_major_locator(mdates.DayLocator(interval=max(1, h1_view_days // 8)))
-            ax_1h.xaxis.set_major_formatter(mdates.DateFormatter('%b %d'))
-        else:
-            ax_1h.xaxis.set_major_formatter(mdates.DateFormatter('%b %d\n%H:%M UTC'))
+        # Adaptive formatting for a 20-day horizon (ticks every 2 days)
+        ax_1h.xaxis.set_major_locator(mdates.DayLocator(interval=2))
+        ax_1h.xaxis.set_major_formatter(mdates.DateFormatter('%b %d'))
             
         ax_1h.set_ylabel('Spot Price (USD)')
         ax_1h.legend(loc='upper left', bbox_to_anchor=(1, 1))
