@@ -1,6 +1,12 @@
+import streamlit as st
 import yfinance as yf
 import pandas as pd
 import numpy as np
+
+# --- STREAMLIT UI SETUP ---
+st.set_page_config(page_title="SMC Backtest Engine", layout="centered")
+st.title("📊 SMC 6-Month Backtest Results")
+st.write("Simulating Optimal Trade Entry (OTE) Strategy on XAUUSD...")
 
 # --- CONFIGURATION ---
 CAPITAL = 15000.0
@@ -11,11 +17,11 @@ INTERVAL = "1h"
 WINDOW = 15  # Swing high/low lookback
 
 def run_smc_backtest():
-    print(f"Fetching {PERIOD} of {INTERVAL} data for {SYMBOL}...")
-    df = yf.download(SYMBOL, period=PERIOD, interval=INTERVAL, progress=False)
+    with st.spinner(f"Fetching {PERIOD} of {INTERVAL} data for {SYMBOL}..."):
+        df = yf.download(SYMBOL, period=PERIOD, interval=INTERVAL, progress=False)
     
     if df.empty:
-        print("Failed to fetch data.")
+        st.error("Failed to fetch data from Yahoo Finance.")
         return
 
     if isinstance(df.columns, pd.MultiIndex):
@@ -70,7 +76,7 @@ def run_smc_backtest():
     # --- CALCULATE METRICS ---
     total_trades = len(trades)
     if total_trades == 0:
-        print("No trades triggered with these parameters.")
+        st.warning("No trades triggered with these parameters.")
         return
         
     wins = len([t for t in trades if t['Type'] == 'Win'])
@@ -82,15 +88,24 @@ def run_smc_backtest():
     net_profit_usd = total_pnl_r * (CAPITAL * RISK_PER_TRADE)
     final_balance = CAPITAL + net_profit_usd
     
-    print("\n" + "="*45)
-    print("       SMC 6-MONTH BACKTEST RESULTS        ")
-    print("="*45)
-    print(f"Total Trades Executed: {total_trades}")
-    print(f"Win Rate:              {win_rate:.2f}%")
-    print(f"Wins: {wins} | Losses: {losses}")
-    print(f"Total Net Return:      ${net_profit_usd:,.2f}")
-    print(f"Ending Balance:        ${final_balance:,.2f}")
-    print("="*45)
+    # --- STREAMLIT METRICS DISPLAY ---
+    st.success("Backtest Complete!")
+    st.divider()
+    
+    col1, col2, col3 = st.columns(3)
+    col1.metric("Total Trades Executed", total_trades)
+    col2.metric("Win Rate", f"{win_rate:.2f}%")
+    col3.metric("Wins vs Losses", f"{wins} W / {losses} L")
+    
+    st.divider()
+    
+    col4, col5 = st.columns(2)
+    col4.metric("Starting Capital", f"${CAPITAL:,.2f}")
+    col4.metric("Risk Per Trade", f"${CAPITAL * RISK_PER_TRADE:,.2f} (2%)")
+    
+    col6, col7 = st.columns(2)
+    col6.metric("Total Net Return", f"${net_profit_usd:,.2f}", delta=f"{(net_profit_usd/CAPITAL)*100:.2f}%")
+    col7.metric("Ending Balance", f"${final_balance:,.2f}")
 
 if __name__ == "__main__":
     run_smc_backtest()
