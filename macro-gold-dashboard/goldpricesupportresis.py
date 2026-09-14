@@ -7,20 +7,11 @@ import matplotlib.pyplot as plt
 import matplotlib.dates as mdates
 
 # --- PAGE CONFIG ---
-st.set_page_config(page_title="XAUUSD Multi-Timeframe Levels", layout="wide")
-st.title("Gold (XAUUSD) Multi-Timeframe Structural Levels")
+st.set_page_config(page_title="Live XAUUSD Structural Levels", layout="wide")
+st.title("Live Gold (XAUUSD) Structural Levels")
 
-# --- SPOT BASIS CALIBRATION CONTROLS ---
-st.sidebar.header("Price & Session Settings")
-target_spot_price = st.sidebar.number_input(
-    "Target Spot Close (XAUUSD)",
-    min_value=1000.0,
-    max_value=10000.0,
-    value=4348.00,
-    step=0.50,
-    help="Anchors the COMEX futures structure to your broker's exact spot closing price."
-)
-
+# --- CHART CONTROLS ---
+st.sidebar.header("Chart Settings")
 h1_view_days = st.sidebar.slider(
     "1-Hour Chart Lookback (Days)",
     min_value=3,
@@ -29,17 +20,15 @@ h1_view_days = st.sidebar.slider(
     help="Zoom in on recent days to see session overlap shading clearly."
 )
 
-# --- DATA FETCHING ---
-@st.cache_data(ttl=1800)
-def fetch_gold_data(spot_anchor: float):
-    # Fetch 90 days of 1-Hour data for 1H and 4H structures
-    df_1h = yf.download('GC=F', period="90d", interval='1h', progress=False)
-    
-    # Fetch 1 Year of Daily data for macro D1 structure
-    df_1d = yf.download('GC=F', period="1y", interval='1d', progress=False)
+# --- DATA FETCHING (LIVE SPOT XAUUSD) ---
+@st.cache_data(ttl=300) # Refreshes every 5 minutes to stay "live"
+def fetch_live_spot_data():
+    # Ticker XAUUSD=X pulls the direct spot price, eliminating futures premium
+    df_1h = yf.download('XAUUSD=X', period="90d", interval='1h', progress=False)
+    df_1d = yf.download('XAUUSD=X', period="1y", interval='1d', progress=False)
     
     if df_1h.empty or df_1d.empty:
-        st.error("Failed to fetch data from Yahoo Finance. The API might be temporarily unavailable.")
+        st.error("Failed to fetch live data from Yahoo Finance. The API might be temporarily unavailable.")
         return pd.DataFrame(), pd.DataFrame(), pd.DataFrame()
 
     # Flatten MultiIndex columns if present
@@ -59,22 +48,13 @@ def fetch_gold_data(spot_anchor: float):
     else:
         df_1d.index = df_1d.index.tz_convert('UTC')
 
-    # Calculate basis premium (Futures Premium over Spot)
-    latest_futures_close = float(df_1h['Close'].dropna().iloc[-1])
-    basis_offset = latest_futures_close - spot_anchor
-
-    # Calibrate datasets to true Spot prices
-    for col in ['Open', 'High', 'Low', 'Close']:
-        df_1h[col] = df_1h[col] - basis_offset
-        df_1d[col] = df_1d[col] - basis_offset
-
-    # Resample calibrated 1-hour candles into 4-hour structural bars
+    # Resample 1-hour spot candles into 4-hour structural bars
     df_4h = df_1h.resample('4h').agg({
         'Open': 'first',
         'High': 'max',
         'Low': 'min',
         'Close': 'last',
-        'Volume': 'sum'
+        # Spot forex feeds often lack volume; drop it or use placeholder
     }).dropna()
     
     return df_1h, df_4h, df_1d
@@ -107,18 +87,16 @@ def shade_london_ny_overlap(ax, df_subset):
     shaded_label_added = False
     
     for day in unique_dates:
-        # Define start and end of overlap window in UTC
         session_start = pd.Timestamp(day, tz='UTC') + pd.Timedelta(hours=12)
         session_end = pd.Timestamp(day, tz='UTC') + pd.Timedelta(hours=16)
         
-        # Only shade if within subset boundaries
         if session_end >= df_subset.index.min() and session_start <= df_subset.index.max():
             lbl = "London/NY Overlap (Peak Volume)" if not shaded_label_added else ""
             ax.axvspan(session_start, session_end, color='goldenrod', alpha=0.18, label=lbl)
             shaded_label_added = True
 
 # --- DATA PROCESSING ---
-df_1h, df_4h, df_1d = fetch_gold_data(target_spot_price)
+df_1h, df_4h, df_1d = fetch_live_spot_data()
 
 if not df_1h.empty and not df_1d.empty:
     live_price = float(df_1h['Close'].iloc[-1])
@@ -136,7 +114,7 @@ if not df_1h.empty and not df_1d.empty:
     r1_1h, s_min_1h, s_maj1_1h, s_maj2_1h = extract_key_levels(supports_1h, resistances_1h, live_price)
 
     # --- WRITTEN FORMAT DISPLAY ---
-    st.subheader(f"Live Calibrated Spot Price: ~${live_price:,.2f}")
+    st.subheader(f"Live Market Spot Price: ~${live_price:,.2f}")
     
     col_1d, col_4h, col_1h = st.columns(3)
     
@@ -173,76 +151,52 @@ if not df_1h.empty and not df_1d.empty:
     tab_1d, tab_4h, tab_1h = st.tabs(["Daily Macro Chart", "4-Hour Swing Chart", "1-Hour Intraday Chart"])
 
     with tab_1d:
-        st.subheader("Daily Institutional Structure (1 Year - Spot Calibrated)")
+        st.subheader("Daily Institutional Structure (1 Year - True Spot)")
         fig_1d, ax_1d = plt.subplots(figsize=(14, 6))
         ax_1d.plot(df_1d.index, df_1d['Close'], label='D1 Close Price', color='black', linewidth=1.5)
         
-        if r1_1d:
-            ax_1d.axhline(r1_1d, color='red', linestyle='--', alpha=0.85, linewidth=2, label=f'D1 Supply (${r1_1d:,.2f})')
-        if s_min_1d:
-            ax_1d.axhline(s_min_1d, color='lightgreen', linestyle='--', alpha=0.9, linewidth=1.5, label=f'D1 Minor Demand (${s_min_1d:,.2f})')
-        if s_maj1_1d:
-            ax_1d.axhline(s_maj1_1d, color='green', linestyle='-', alpha=0.75, linewidth=2, label=f'D1 Major Demand 1 (${s_maj1_1d:,.2f})')
-        if s_maj2_1d:
-            ax_1d.axhline(s_maj2_1d, color='darkgreen', linestyle='-', alpha=0.9, linewidth=2.5, label=f'D1 Major Demand 2 (${s_maj2_1d:,.2f})')
+        if r1_1d: ax_1d.axhline(r1_1d, color='red', linestyle='--', alpha=0.85, linewidth=2)
+        if s_min_1d: ax_1d.axhline(s_min_1d, color='lightgreen', linestyle='--', alpha=0.9, linewidth=1.5)
+        if s_maj1_1d: ax_1d.axhline(s_maj1_1d, color='green', linestyle='-', alpha=0.75, linewidth=2)
+        if s_maj2_1d: ax_1d.axhline(s_maj2_1d, color='darkgreen', linestyle='-', alpha=0.9, linewidth=2.5)
         
-        ax_1d.set_title('XAUUSD Daily Macro Structure')
-        ax_1d.set_ylabel('Price (USD)')
-        ax_1d.legend(loc='upper left', bbox_to_anchor=(1, 1))
+        ax_1d.set_title('XAUUSD Live Daily Spot Structure')
+        ax_1d.set_ylabel('Spot Price (USD)')
         ax_1d.grid(alpha=0.2)
         st.pyplot(fig_1d)
 
     with tab_4h:
-        st.subheader("4-Hour Structural Chart (90 Days - Spot Calibrated)")
+        st.subheader("4-Hour Structural Chart (90 Days - True Spot)")
         fig_4h, ax_4h = plt.subplots(figsize=(14, 6))
         ax_4h.plot(df_4h.index, df_4h['Close'], label='H4 Close Price', color='black', linewidth=1.5)
         
-        if r1_4h:
-            ax_4h.axhline(r1_4h, color='red', linestyle='--', alpha=0.85, linewidth=2, label=f'H4 Supply (${r1_4h:,.2f})')
-        if s_min_4h:
-            ax_4h.axhline(s_min_4h, color='lightgreen', linestyle='--', alpha=0.9, linewidth=1.5, label=f'H4 Minor Demand (${s_min_4h:,.2f})')
-        if s_maj1_4h:
-            ax_4h.axhline(s_maj1_4h, color='green', linestyle='-', alpha=0.75, linewidth=2, label=f'H4 Major Demand 1 (${s_maj1_4h:,.2f})')
-        if s_maj2_4h:
-            ax_4h.axhline(s_maj2_4h, color='darkgreen', linestyle='-', alpha=0.9, linewidth=2.5, label=f'H4 Major Demand 2 (${s_maj2_4h:,.2f})')
+        if r1_4h: ax_4h.axhline(r1_4h, color='red', linestyle='--', alpha=0.85, linewidth=2)
+        if s_min_4h: ax_4h.axhline(s_min_4h, color='lightgreen', linestyle='--', alpha=0.9, linewidth=1.5)
+        if s_maj1_4h: ax_4h.axhline(s_maj1_4h, color='green', linestyle='-', alpha=0.75, linewidth=2)
+        if s_maj2_4h: ax_4h.axhline(s_maj2_4h, color='darkgreen', linestyle='-', alpha=0.9, linewidth=2.5)
         
-        ax_4h.set_title('XAUUSD 4-Hour Macro Structure')
-        ax_4h.set_ylabel('Price (USD)')
-        ax_4h.legend(loc='upper left', bbox_to_anchor=(1, 1))
+        ax_4h.set_title('XAUUSD Live 4-Hour Spot Structure')
+        ax_4h.set_ylabel('Spot Price (USD)')
         ax_4h.grid(alpha=0.2)
         st.pyplot(fig_4h)
 
     with tab_1h:
         st.subheader(f"1-Hour Intraday Chart (Last {h1_view_days} Days - Session Highlighted)")
-        
-        # Filter 1H dataset based on sidebar slider for clear inspection
         cutoff_date = df_1h.index.max() - pd.Timedelta(days=h1_view_days)
         df_1h_view = df_1h[df_1h.index >= cutoff_date]
         
         fig_1h, ax_1h = plt.subplots(figsize=(14, 6))
-        
-        # 1. Overlay Institutional Session Shading (London/NY Overlap)
         shade_london_ny_overlap(ax_1h, df_1h_view)
-        
-        # 2. Plot Price
         ax_1h.plot(df_1h_view.index, df_1h_view['Close'], label='H1 Close Price', color='navy', linewidth=1.4)
         
-        # 3. Horizontal Support & Resistance Levels
-        if r1_1h:
-            ax_1h.axhline(r1_1h, color='red', linestyle='--', alpha=0.85, linewidth=2, label=f'H1 Supply (${r1_1h:,.2f})')
-        if s_min_1h:
-            ax_1h.axhline(s_min_1h, color='lightgreen', linestyle='--', alpha=0.9, linewidth=1.5, label=f'H1 Minor Demand (${s_min_1h:,.2f})')
-        if s_maj1_1h:
-            ax_1h.axhline(s_maj1_1h, color='green', linestyle='-', alpha=0.75, linewidth=2, label=f'H1 Major Demand 1 (${s_maj1_1h:,.2f})')
-        if s_maj2_1h:
-            ax_1h.axhline(s_maj2_1h, color='darkgreen', linestyle='-', alpha=0.9, linewidth=2.5, label=f'H1 Major Demand 2 (${s_maj2_1h:,.2f})')
+        if r1_1h: ax_1h.axhline(r1_1h, color='red', linestyle='--', alpha=0.85, linewidth=2, label=f'H1 Supply (${r1_1h:,.2f})')
+        if s_min_1h: ax_1h.axhline(s_min_1h, color='lightgreen', linestyle='--', alpha=0.9, linewidth=1.5, label=f'H1 Minor Demand (${s_min_1h:,.2f})')
+        if s_maj1_1h: ax_1h.axhline(s_maj1_1h, color='green', linestyle='-', alpha=0.75, linewidth=2, label=f'H1 Major Demand 1 (${s_maj1_1h:,.2f})')
+        if s_maj2_1h: ax_1h.axhline(s_maj2_1h, color='darkgreen', linestyle='-', alpha=0.9, linewidth=2.5, label=f'H1 Major Demand 2 (${s_maj2_1h:,.2f})')
         
-        # Format X-axis dates clearly
         ax_1h.xaxis.set_major_formatter(mdates.DateFormatter('%b %d\n%H:%M UTC'))
-        
-        ax_1h.set_title('XAUUSD 1-Hour Intraday Structure with Session Overlap')
-        ax_1h.set_ylabel('Price (USD)')
+        ax_1h.set_title('XAUUSD Live 1-Hour Intraday Structure with Session Overlap')
+        ax_1h.set_ylabel('Spot Price (USD)')
         ax_1h.legend(loc='upper left', bbox_to_anchor=(1, 1))
         ax_1h.grid(alpha=0.2)
         st.pyplot(fig_1h)
-        st.caption("Golden bands indicate the London & New York Session Overlap (12:00 – 16:00 UTC), representing the highest probability execution windows.")
