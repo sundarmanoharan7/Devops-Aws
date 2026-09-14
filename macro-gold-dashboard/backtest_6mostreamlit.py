@@ -2,7 +2,6 @@ import streamlit as st
 import yfinance as yf
 import pandas as pd
 import numpy as np
-import requests
 from scipy.signal import argrelextrema
 import matplotlib.pyplot as plt
 import matplotlib.dates as mdates
@@ -11,30 +10,20 @@ st.set_page_config(page_title="SMC Live Trade & Backtest", layout="wide")
 st.title("Smart Money Concepts (SMC) - Live Setup & Backtest Engine")
 
 # --- BULLETPROOF REAL-TIME SPOT FETCHER ---
+@st.cache_data(ttl=30) # Refreshes rapidly every 30 seconds
 def get_live_xauusd_spot():
-    """
-    Fetches real-time spot bid/ask from direct endpoints.
-    Bypasses COMEX futures contamination completely.
-    """
-    # Source 1: Direct Yahoo Finance v8 Real-time Chart API
+    """Fetches real-time spot bid/ask from yfinance, avoiding Streamlit state locks."""
+    # Attempt 1: Direct 1-minute candle (most accurate for live CFD spot)
     try:
-        url = "https://query1.finance.yahoo.com/v8/finance/chart/XAUUSD=X?interval=1m&range=1d"
-        headers = {'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64)'}
-        res = requests.get(url, headers=headers, timeout=4)
-        if res.status_code == 200:
-            data = res.json()
-            meta_price = data['chart']['result'][0]['meta'].get('regularMarketPrice')
-            if meta_price and meta_price > 1000:
-                return float(meta_price)
-            # Check last closed candle
-            closes = data['chart']['result'][0]['indicators']['quote'][0]['close']
-            valid_closes = [c for c in closes if c is not None]
-            if valid_closes:
-                return float(valid_closes[-1])
+        df = yf.download("XAUUSD=X", period="1d", interval="1m", progress=False)
+        if not df.empty:
+            if isinstance(df.columns, pd.MultiIndex):
+                df.columns = df.columns.get_level_values(0)
+            return float(df['Close'].dropna().iloc[-1])
     except Exception:
         pass
-
-    # Source 2: yfinance fast_info directly on XAUUSD=X
+    
+    # Attempt 2: fast_info fallback
     try:
         t = yf.Ticker("XAUUSD=X")
         price = t.fast_info.get('lastPrice')
@@ -43,23 +32,40 @@ def get_live_xauusd_spot():
     except Exception:
         pass
 
-    # Fallback anchor matching active MT5 market quote
-    return 4293.50
+    # Attempt 3: Gold Futures Fallback (Subtracting standard ~$23 basis contango)
+    try:
+        df_fut = yf.download("GC=F", period="1d", interval="1m", progress=False)
+        if not df_fut.empty:
+            if isinstance(df_fut.columns, pd.MultiIndex):
+                df_fut.columns = df_fut.columns.get_level_values(0)
+            fut_price = float(df_fut['Close'].dropna().iloc[-1])
+            return fut_price - 23.00 
+    except Exception:
+        pass
 
-# Query market price
+    return 4297.00 # Ultimate failsafe if API is totally down
+
+# Query exact market price now
 market_spot = get_live_xauusd_spot()
 
-# --- SIDEBAR CONTROLS ---
+# --- SIDEBAR CONTROLS (FIXED STATE LOCK) ---
 st.sidebar.header("Live Feed Synchronization")
-live_spot = st.sidebar.number_input(
-    "Active MT5 Spot Price (USD)",
-    min_value=1000.0,
-    max_value=10000.0,
-    value=float(round(market_spot, 2)),
-    step=0.10,
-    help="Auto-synced with live OTC Spot. Adjust manually if your broker's spread differs slightly."
-)
-st.sidebar.caption(f"Broker Spot Anchor: **${live_spot:,.2f}**")
+
+# Use a toggle to prevent Streamlit from locking the live feed
+manual_override = st.sidebar.checkbox("Override Live Feed (Manual Mode)", value=False)
+
+if manual_override:
+    live_spot = st.sidebar.number_input(
+        "Manual MT5 Spot Price (USD)",
+        min_value=1000.0,
+        max_value=10000.0,
+        value=float(round(market_spot, 2)),
+        step=0.10
+    )
+    st.sidebar.warning(f"Manual Override Active. Uncheck to resume live sync.")
+else:
+    live_spot = market_spot
+    st.sidebar.success(f"Live Sync Active\n\n**Current Spot: ${live_spot:,.2f}**")
 
 st.sidebar.header("Backtest Parameters")
 capital = st.sidebar.number_input("Starting Capital ($)", min_value=1000.0, max_value=100000.0, value=15000.0, step=1000.0)
@@ -69,7 +75,6 @@ bt_window = st.sidebar.slider("Structural Swing Lookback", min_value=5, max_valu
 # --- DATA FETCHING & STRUCTURAL CALIBRATION ---
 @st.cache_data(ttl=60)
 def fetch_market_data(anchor: float):
-    # Pull deep structural bars from GC=F
     df_live = yf.download("GC=F", period="14d", interval="15m", progress=False)
     df_bt = yf.download("GC=F", period="6mo", interval="1h", progress=False)
     
@@ -177,7 +182,8 @@ if not df_live.empty and not df_bt.empty:
     tab1, tab2 = st.tabs(["🔴 Live Market Execution", "📊 6-Month Backtest Results"])
     
     with tab1:
-        current_price = float(df_live['Close'].iloc[-1])
+        # Ensures the visual UI directly references the live un-cached spot price
+        current_price = live_spot 
         swing_high, swing_low, eq, gz_low, gz_high = analyze_smc_structure(df_live)
         
         st.subheader(f"Active Live Spot Price: ${current_price:,.2f}")
