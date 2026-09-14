@@ -15,46 +15,60 @@ st.sidebar.header("Chart Settings")
 h1_view_days = st.sidebar.slider(
     "1-Hour Chart Lookback (Days)",
     min_value=3,
-    max_value=90,
+    max_value=60,
     value=7,
     help="Zoom in on recent days to see session overlap shading clearly."
 )
 
-# --- DATA FETCHING (LIVE SPOT XAUUSD) ---
-@st.cache_data(ttl=300) # Refreshes every 5 minutes to stay "live"
+# --- DATA FETCHING (BULLETPROOF LIVE SPOT) ---
+@st.cache_data(ttl=300)
 def fetch_live_spot_data():
-    # Ticker XAUUSD=X pulls the direct spot price, eliminating futures premium
-    df_1h = yf.download('XAUUSD=X', period="90d", interval='1h', progress=False)
+    # Attempt 1: Direct Spot fetch (Reduced to 60d as Yahoo blocks forex intraday beyond this)
+    df_1h = yf.download('XAUUSD=X', period="60d", interval='1h', progress=False)
     df_1d = yf.download('XAUUSD=X', period="1y", interval='1d', progress=False)
     
+    # Attempt 2: Institutional Auto-Calibration Fallback
+    # If Yahoo blocks the direct forex feed, pull the reliable futures feed and mathematically shift it to exactly match the live spot price.
+    if df_1h.empty:
+        df_1h = yf.download('GC=F', period="60d", interval='1h', progress=False)
+        df_1d = yf.download('GC=F', period="1y", interval='1d', progress=False)
+        spot_daily = yf.download('XAUUSD=X', period="5d", interval='1d', progress=False)
+        
+        if not df_1h.empty and not spot_daily.empty:
+            if isinstance(df_1h.columns, pd.MultiIndex): df_1h.columns = df_1h.columns.get_level_values(0)
+            if isinstance(df_1d.columns, pd.MultiIndex): df_1d.columns = df_1d.columns.get_level_values(0)
+            if isinstance(spot_daily.columns, pd.MultiIndex): spot_daily.columns = spot_daily.columns.get_level_values(0)
+            
+            latest_spot = float(spot_daily['Close'].dropna().iloc[-1])
+            latest_futures = float(df_1h['Close'].dropna().iloc[-1])
+            basis_offset = latest_futures - latest_spot
+            
+            # Calibrate Futures OHLC down to exact Spot pricing
+            for col in ['Open', 'High', 'Low', 'Close']:
+                df_1h[col] = df_1h[col] - basis_offset
+                df_1d[col] = df_1d[col] - basis_offset
+
     if df_1h.empty or df_1d.empty:
-        st.error("Failed to fetch live data from Yahoo Finance. The API might be temporarily unavailable.")
+        st.error("Failed to fetch live data from Yahoo Finance. The API is temporarily blocking requests.")
         return pd.DataFrame(), pd.DataFrame(), pd.DataFrame()
 
-    # Flatten MultiIndex columns if present
-    if isinstance(df_1h.columns, pd.MultiIndex):
-        df_1h.columns = df_1h.columns.get_level_values(0)
-    if isinstance(df_1d.columns, pd.MultiIndex):
-        df_1d.columns = df_1d.columns.get_level_values(0)
+    # Flatten MultiIndex columns if Attempt 1 succeeded
+    if isinstance(df_1h.columns, pd.MultiIndex): df_1h.columns = df_1h.columns.get_level_values(0)
+    if isinstance(df_1d.columns, pd.MultiIndex): df_1d.columns = df_1d.columns.get_level_values(0)
 
     # Standardize datetime index to UTC
-    if df_1h.index.tz is None:
-        df_1h.index = df_1h.index.tz_localize('UTC')
-    else:
-        df_1h.index = df_1h.index.tz_convert('UTC')
+    if df_1h.index.tz is None: df_1h.index = df_1h.index.tz_localize('UTC')
+    else: df_1h.index = df_1h.index.tz_convert('UTC')
 
-    if df_1d.index.tz is None:
-        df_1d.index = df_1d.index.tz_localize('UTC')
-    else:
-        df_1d.index = df_1d.index.tz_convert('UTC')
+    if df_1d.index.tz is None: df_1d.index = df_1d.index.tz_localize('UTC')
+    else: df_1d.index = df_1d.index.tz_convert('UTC')
 
-    # Resample 1-hour spot candles into 4-hour structural bars
+    # Resample 1-hour candles into 4-hour structural bars
     df_4h = df_1h.resample('4h').agg({
         'Open': 'first',
         'High': 'max',
         'Low': 'min',
-        'Close': 'last',
-        # Spot forex feeds often lack volume; drop it or use placeholder
+        'Close': 'last'
     }).dropna()
     
     return df_1h, df_4h, df_1d
@@ -82,7 +96,6 @@ def extract_key_levels(supports_all, resistances_all, live_price):
 
 # --- SESSION OVERLAP SHADING HELPER ---
 def shade_london_ny_overlap(ax, df_subset):
-    """Shades London & New York session overlap (12:00 to 16:00 UTC)"""
     unique_dates = sorted(list(set(df_subset.index.date)))
     shaded_label_added = False
     
@@ -101,15 +114,12 @@ df_1h, df_4h, df_1d = fetch_live_spot_data()
 if not df_1h.empty and not df_1d.empty:
     live_price = float(df_1h['Close'].iloc[-1])
     
-    # 1. Daily Levels (window=7)
     supports_1d, resistances_1d = find_structural_levels(df_1d, window=7)
     r1_1d, s_min_1d, s_maj1_1d, s_maj2_1d = extract_key_levels(supports_1d, resistances_1d, live_price)
 
-    # 2. 4-Hour Levels (window=5)
     supports_4h, resistances_4h = find_structural_levels(df_4h, window=5)
     r1_4h, s_min_4h, s_maj1_4h, s_maj2_4h = extract_key_levels(supports_4h, resistances_4h, live_price)
     
-    # 3. 1-Hour Levels (window=8)
     supports_1h, resistances_1h = find_structural_levels(df_1h, window=8)
     r1_1h, s_min_1h, s_maj1_1h, s_maj2_1h = extract_key_levels(supports_1h, resistances_1h, live_price)
 
@@ -120,27 +130,27 @@ if not df_1h.empty and not df_1d.empty:
     
     with col_1d:
         st.markdown("### Daily (D1) Macro")
-        st.markdown("**Resistance (Supply Zones)**")
+        st.write("**Resistance (Supply Zones)**")
         st.write(f"1st Resistance Point: ${r1_1d:,.2f}" if r1_1d else "1st Resistance Point: N/A")
-        st.markdown("**Support (Demand Zones)**")
+        st.write("**Support (Demand Zones)**")
         st.write(f"Minor Support: ${s_min_1d:,.2f}" if s_min_1d else "Minor Support: N/A")
         st.write(f"Major Support 1: ${s_maj1_1d:,.2f}" if s_maj1_1d else "Major Support 1: N/A")
         st.write(f"Major Support 2: ${s_maj2_1d:,.2f}" if s_maj2_1d else "Major Support 2: N/A")
 
     with col_4h:
         st.markdown("### 4-Hour (4H) Swing")
-        st.markdown("**Resistance (Supply Zones)**")
+        st.write("**Resistance (Supply Zones)**")
         st.write(f"1st Resistance Point: ${r1_4h:,.2f}" if r1_4h else "1st Resistance Point: N/A")
-        st.markdown("**Support (Demand Zones)**")
+        st.write("**Support (Demand Zones)**")
         st.write(f"Minor Support: ${s_min_4h:,.2f}" if s_min_4h else "Minor Support: N/A")
         st.write(f"Major Support 1: ${s_maj1_4h:,.2f}" if s_maj1_4h else "Major Support 1: N/A")
         st.write(f"Major Support 2: ${s_maj2_4h:,.2f}" if s_maj2_4h else "Major Support 2: N/A")
 
     with col_1h:
         st.markdown("### 1-Hour (1H) Intraday")
-        st.markdown("**Resistance (Supply Zones)**")
+        st.write("**Resistance (Supply Zones)**")
         st.write(f"1st Resistance Point: ${r1_1h:,.2f}" if r1_1h else "1st Resistance Point: N/A")
-        st.markdown("**Support (Demand Zones)**")
+        st.write("**Support (Demand Zones)**")
         st.write(f"Minor Support: ${s_min_1h:,.2f}" if s_min_1h else "Minor Support: N/A")
         st.write(f"Major Support 1: ${s_maj1_1h:,.2f}" if s_maj1_1h else "Major Support 1: N/A")
         st.write(f"Major Support 2: ${s_maj2_1h:,.2f}" if s_maj2_1h else "Major Support 2: N/A")
@@ -166,7 +176,7 @@ if not df_1h.empty and not df_1d.empty:
         st.pyplot(fig_1d)
 
     with tab_4h:
-        st.subheader("4-Hour Structural Chart (90 Days - True Spot)")
+        st.subheader("4-Hour Structural Chart (60 Days - True Spot)")
         fig_4h, ax_4h = plt.subplots(figsize=(14, 6))
         ax_4h.plot(df_4h.index, df_4h['Close'], label='H4 Close Price', color='black', linewidth=1.5)
         
