@@ -12,22 +12,39 @@ st.title("Macro-Driven Gold Strategy (DXY & Real Yields)")
 # Static CPI from fundamental analysis
 CURRENT_CPI = 3.35 
 
-# --- DATA PIPELINE ---
+# --- DATA PIPELINE (ROBUST FIX) ---
 @st.cache_data(ttl=3600)
 def fetch_macro_data():
-    """Fetches 6 months of daily data and dynamically updates going forward."""
-    tickers = ["GC=F", "DX-Y.NYB", "^TNX"]
+    """Fetches 6 months of daily data using isolated downloads to prevent API multi-ticker crashes."""
+    target_tickers = {"GC=F": "Gold", "DX-Y.NYB": "DXY", "^TNX": "Nominal_10Y"}
+    series_list = []
     
-    # Download close prices
-    data = yf.download(tickers, period="6mo", interval="1d", progress=False)
-    
-    if isinstance(data.columns, pd.MultiIndex):
-        df = data['Close'].copy()
-    else:
-        df = data.copy()
+    for ticker, col_name in target_tickers.items():
+        try:
+            # Download individually to bypass yfinance MultiIndex formatting issues
+            data = yf.download(ticker, period="6mo", interval="1d", progress=False)
+            
+            if not data.empty:
+                # Clean up columns just in case yfinance still returns a MultiIndex for single tickers
+                if isinstance(data.columns, pd.MultiIndex):
+                    data.columns = data.columns.get_level_values(0)
+                
+                close_series = data['Close']
+                close_series.name = col_name
+                series_list.append(close_series)
+        except Exception:
+            pass
+            
+    # If any of the 3 required feeds failed, abort to prevent bad math
+    if len(series_list) < 3:
+        return pd.DataFrame()
         
+    # Merge all individual series into one DataFrame based on the date index
+    df = pd.concat(series_list, axis=1)
+    
+    # CRITICAL FIX: Forward-fill data first. Bond markets, Futures, and Forex have different holiday schedules.
+    df.ffill(inplace=True) 
     df.dropna(inplace=True)
-    df.rename(columns={"GC=F": "Gold", "DX-Y.NYB": "DXY", "^TNX": "Nominal_10Y"}, inplace=True)
     
     # Calculate Real 10-Year Yield
     df['Real_Yield'] = df['Nominal_10Y'] - CURRENT_CPI
@@ -117,4 +134,4 @@ if not df_raw.empty:
     st.dataframe(display_df.tail(30), use_container_width=True)
 
 else:
-    st.error("Market data feeds are currently unreachable.")
+    st.error("Market data feeds are currently unreachable. Please check your internet connection or try again shortly.")
