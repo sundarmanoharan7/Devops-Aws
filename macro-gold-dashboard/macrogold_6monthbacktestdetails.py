@@ -124,13 +124,14 @@ def analyze_smc_structure(df, window=12):
     
     return recent_high, recent_low, equilibrium, golden_zone_low, golden_zone_high
 
-# --- BACKTESTING ENGINE ---
+# --- BACKTESTING ENGINE (LONG & SHORT SUPPORT) ---
 def run_backtest(df, start_capital, risk, window):
     df = df.copy()
     df['Swing_High'] = df['High'].rolling(window=window*2, center=True).max().ffill()
     df['Swing_Low'] = df['Low'].rolling(window=window*2, center=True).min().ffill()
     
     in_trade = False
+    trade_type = None  
     entry_price, stop_loss, take_profit = 0.0, 0.0, 0.0
     entry_date = None
     
@@ -141,6 +142,9 @@ def run_backtest(df, start_capital, risk, window):
     
     for i in range(window, len(df)):
         close = df['Close'].iloc[i]
+        curr_high = df['High'].iloc[i]
+        curr_low = df['Low'].iloc[i]
+        
         high = df['Swing_High'].iloc[i]
         low = df['Swing_Low'].iloc[i]
         date = df.index[i]
@@ -150,48 +154,64 @@ def run_backtest(df, start_capital, risk, window):
             
         total_range = high - low
         eq = high - (total_range * 0.50)
-        ote_low = high - (total_range * 0.382)
-        ote_high = high - (total_range * 0.214)
         
-        if not in_trade and (ote_low <= close <= ote_high) and close > eq:
-            in_trade = True
-            entry_price = close
-            stop_loss = high + 2.50
-            take_profit = low
-            entry_date = date
-            
-        elif in_trade:
-            if df['High'].iloc[i] >= stop_loss:
-                loss_amt = equity * (risk / 100)
-                equity -= loss_amt
-                trades.append({
-                    'Entry Date': entry_date,
-                    'Exit Date': date,
-                    'Result': 'Loss',
-                    'Entry Price': entry_price,
-                    'Stop Loss': stop_loss,
-                    'Target (TP)': take_profit,
-                    'Net P&L': -loss_amt
-                })
-                in_trade = False
-                equity_curve.append(equity)
-                dates.append(date)
+        # Premium Supply (Short) Zone
+        short_ote_low = high - (total_range * 0.382)
+        short_ote_high = high - (total_range * 0.214)
+        
+        # Discount Demand (Long) Zone
+        long_ote_high = low + (total_range * 0.382)
+        long_ote_low = low + (total_range * 0.214)
+        
+        if not in_trade:
+            # 1. Bearish Setup (Short)
+            if (short_ote_low <= close <= short_ote_high) and close > eq:
+                in_trade = True
+                trade_type = 'Short'
+                entry_price = close
+                stop_loss = high + 2.50
+                take_profit = low
+                entry_date = date
                 
-            elif df['Low'].iloc[i] <= take_profit:
-                risk_amt = equity * (risk / 100)
-                reward_ratio = (entry_price - take_profit) / (stop_loss - entry_price)
-                win_amt = risk_amt * reward_ratio
-                equity += win_amt
-                trades.append({
-                    'Entry Date': entry_date,
-                    'Exit Date': date,
-                    'Result': 'Win',
-                    'Entry Price': entry_price,
-                    'Stop Loss': stop_loss,
-                    'Target (TP)': take_profit,
-                    'Net P&L': win_amt
-                })
-                in_trade = False
+            # 2. Bullish Setup (Long)
+            elif (long_ote_low <= close <= long_ote_high) and close < eq:
+                in_trade = True
+                trade_type = 'Long'
+                entry_price = close
+                stop_loss = low - 2.50
+                take_profit = high
+                entry_date = date
+                
+        elif in_trade:
+            risk_amt = equity * (risk / 100)
+            
+            # SHORT EXITS
+            if trade_type == 'Short':
+                if curr_high >= stop_loss:  
+                    equity -= risk_amt
+                    trades.append({'Entry Date': entry_date, 'Exit Date': date, 'Type': 'Short', 'Result': 'Loss', 'Entry Price': entry_price, 'Stop Loss': stop_loss, 'Target (TP)': take_profit, 'Net P&L': -risk_amt})
+                    in_trade = False
+                elif curr_low <= take_profit:  
+                    reward_ratio = (entry_price - take_profit) / (stop_loss - entry_price)
+                    win_amt = risk_amt * reward_ratio
+                    equity += win_amt
+                    trades.append({'Entry Date': entry_date, 'Exit Date': date, 'Type': 'Short', 'Result': 'Win', 'Entry Price': entry_price, 'Stop Loss': stop_loss, 'Target (TP)': take_profit, 'Net P&L': win_amt})
+                    in_trade = False
+                    
+            # LONG EXITS
+            elif trade_type == 'Long':
+                if curr_low <= stop_loss:  
+                    equity -= risk_amt
+                    trades.append({'Entry Date': entry_date, 'Exit Date': date, 'Type': 'Long', 'Result': 'Loss', 'Entry Price': entry_price, 'Stop Loss': stop_loss, 'Target (TP)': take_profit, 'Net P&L': -risk_amt})
+                    in_trade = False
+                elif curr_high >= take_profit:  
+                    reward_ratio = (take_profit - entry_price) / (entry_price - stop_loss)
+                    win_amt = risk_amt * reward_ratio
+                    equity += win_amt
+                    trades.append({'Entry Date': entry_date, 'Exit Date': date, 'Type': 'Long', 'Result': 'Win', 'Entry Price': entry_price, 'Stop Loss': stop_loss, 'Target (TP)': take_profit, 'Net P&L': win_amt})
+                    in_trade = False
+                    
+            if not in_trade:
                 equity_curve.append(equity)
                 dates.append(date)
                 
@@ -219,15 +239,23 @@ if not df_live.empty and not df_bt.empty:
             st.write(f"**Swing High (BSL):** ${swing_high:,.2f}")
             st.write(f"**Equilibrium (50%):** ${eq:,.2f}")
             st.write(f"**Swing Low (SSL):** ${swing_low:,.2f}")
-            status = "PREMIUM (Sell Allowed)" if current_price > eq else "DISCOUNT (Wait for Retracement)"
+            status = "PREMIUM (Sell Allowed)" if current_price > eq else "DISCOUNT (Buy Allowed)"
             badge_color = "red" if current_price > eq else "green"
             st.markdown(f"**Market Valuation:** :{badge_color}[{status}]")
 
         with col2:
             st.markdown("### SMC Execution Plan")
-            st.write(f"**Optimal Entry Zone:** ${gz_low:,.2f} – ${gz_high:,.2f}")
-            st.write(f"**Stop Loss:** ${swing_high + 2.50:,.2f}")
-            st.write(f"**Take Profit:** ${swing_low:,.2f}")
+            # Dynamically update the execution plan based on whether we are looking for a Long or Short
+            if current_price > eq:
+                st.write(f"**Optimal Short Entry Zone:** ${gz_low:,.2f} – ${gz_high:,.2f}")
+                st.write(f"**Stop Loss:** ${swing_high + 2.50:,.2f}")
+                st.write(f"**Take Profit:** ${swing_low:,.2f}")
+            else:
+                long_ote_high = swing_low + ((swing_high - swing_low) * 0.382)
+                long_ote_low = swing_low + ((swing_high - swing_low) * 0.214)
+                st.write(f"**Optimal Long Entry Zone:** ${long_ote_low:,.2f} – ${long_ote_high:,.2f}")
+                st.write(f"**Stop Loss:** ${swing_low - 2.50:,.2f}")
+                st.write(f"**Take Profit:** ${swing_high:,.2f}")
             
         st.divider()
         st.subheader("15-Minute SMC Market Structure")
@@ -238,7 +266,13 @@ if not df_live.empty and not df_bt.empty:
         
         ax.axhspan(eq, swing_high, color='red', alpha=0.06, label="Premium Zone")
         ax.axhspan(swing_low, eq, color='green', alpha=0.06, label="Discount Zone")
-        ax.axhspan(gz_low, gz_high, color='darkred', alpha=0.25, label="OTE Supply Zone")
+        
+        # Shade both Short and Long OTE zones for full visual context
+        ax.axhspan(gz_low, gz_high, color='darkred', alpha=0.25, label="OTE Supply (Short) Zone")
+        
+        long_ote_high_chart = swing_low + ((swing_high - swing_low) * 0.382)
+        long_ote_low_chart = swing_low + ((swing_high - swing_low) * 0.214)
+        ax.axhspan(long_ote_low_chart, long_ote_high_chart, color='darkgreen', alpha=0.25, label="OTE Demand (Long) Zone")
         
         ax.axhline(swing_high, color='red', linestyle='--', linewidth=1.8, label=f"BSL Stop (${swing_high:,.2f})")
         ax.axhline(swing_low, color='green', linestyle='--', linewidth=1.8, label=f"SSL Target (${swing_low:,.2f})")
@@ -246,7 +280,7 @@ if not df_live.empty and not df_bt.empty:
         
         ax.xaxis.set_major_formatter(mdates.DateFormatter('%b %d\n%H:%M UTC'))
         ax.set_ylabel('Spot Price (USD)')
-        ax.legend(loc='upper right', bbox_to_anchor=(1.15, 1))
+        ax.legend(loc='upper right', bbox_to_anchor=(1.25, 1))
         ax.grid(alpha=0.25)
         st.pyplot(fig)
         
@@ -289,6 +323,10 @@ if not df_live.empty and not df_bt.empty:
             trade_df['Stop Loss'] = trade_df['Stop Loss'].apply(lambda x: f"${x:,.2f}")
             trade_df['Target (TP)'] = trade_df['Target (TP)'].apply(lambda x: f"${x:,.2f}")
             trade_df['Net P&L'] = trade_df['Net P&L'].apply(lambda x: f"${x:,.2f}")
+            
+            # Arrange columns for readability
+            cols = ['Entry Date', 'Exit Date', 'Type', 'Result', 'Entry Price', 'Stop Loss', 'Target (TP)', 'Net P&L']
+            trade_df = trade_df[cols]
             
             st.dataframe(trade_df, use_container_width=True, hide_index=True)
             
