@@ -3,7 +3,6 @@ import yfinance as yf
 import pandas as pd
 import numpy as np
 from scipy.signal import argrelextrema
-import matplotlib.subplots as plt_sub
 import matplotlib.pyplot as plt
 import matplotlib.dates as mdates
 
@@ -11,7 +10,7 @@ st.set_page_config(page_title="SMC Live Trade & Backtest", layout="wide")
 st.title("Smart Money Concepts (SMC) - Live Setup & Backtest Engine")
 
 # --- BULLETPROOF REAL-TIME SPOT FETCHER ---
-@st.cache_data(ttl=30)
+@st.cache_data(ttl=30)  # Refreshes rapidly every 30 seconds
 def get_live_xauusd_spot():
     try:
         df = yf.download("XAUUSD=X", period="1d", interval="1m", progress=False)
@@ -54,7 +53,7 @@ if manual_override:
         min_value=1000.0, max_value=10000.0,
         value=float(round(market_spot, 2)), step=0.10
     )
-    st.sidebar.warning(f"Manual Override Active. Uncheck to resume live sync.")
+    st.sidebar.warning("Manual Override Active. Uncheck to resume live sync.")
 else:
     live_spot = market_spot
     st.sidebar.success(f"Live Sync Active\n\n**Current Spot: ${live_spot:,.2f}**")
@@ -108,7 +107,7 @@ def analyze_smc_structure(df, window=12):
     
     return recent_high, recent_low, equilibrium, golden_zone_low, golden_zone_high
 
-# --- BACKTESTING ENGINE (UPDATED TO LOG FULL TRADE DETAILS) ---
+# --- BACKTESTING ENGINE ---
 def run_backtest(df, start_capital, risk, window):
     df = df.copy()
     df['Swing_High'] = df['High'].rolling(window=window*2, center=True).max().ffill()
@@ -142,15 +141,12 @@ def run_backtest(df, start_capital, risk, window):
             entry_price = close
             stop_loss = high + 2.50
             take_profit = low
-            entry_date = date  # Capture the exact date/time of the entry
+            entry_date = date
             
         elif in_trade:
-            # STOP LOSS HIT
             if df['High'].iloc[i] >= stop_loss:
                 loss_amt = equity * (risk / 100)
                 equity -= loss_amt
-                
-                # Append comprehensive trade dictionary
                 trades.append({
                     'Entry Date': entry_date,
                     'Exit Date': date,
@@ -164,14 +160,11 @@ def run_backtest(df, start_capital, risk, window):
                 equity_curve.append(equity)
                 dates.append(date)
                 
-            # TAKE PROFIT HIT
             elif df['Low'].iloc[i] <= take_profit:
                 risk_amt = equity * (risk / 100)
                 reward_ratio = (entry_price - take_profit) / (stop_loss - entry_price)
                 win_amt = risk_amt * reward_ratio
                 equity += win_amt
-                
-                # Append comprehensive trade dictionary
                 trades.append({
                     'Entry Date': entry_date,
                     'Exit Date': date,
@@ -268,14 +261,11 @@ if not df_live.empty and not df_bt.empty:
             ax2.grid(alpha=0.25)
             st.pyplot(fig2)
             
-            # --- NEW: DETAILED TRADE LOG UI ---
+            # --- DETAILED TRADE LOG UI ---
             st.divider()
             st.subheader("📝 Detailed Trade Ledger")
             
-            # Convert list of dicts to DataFrame
             trade_df = pd.DataFrame(trades)
-            
-            # Format DataFrame columns for clean UI rendering
             trade_df['Entry Date'] = trade_df['Entry Date'].dt.strftime('%b %d, %Y - %H:%M')
             trade_df['Exit Date'] = trade_df['Exit Date'].dt.strftime('%b %d, %Y - %H:%M')
             trade_df['Entry Price'] = trade_df['Entry Price'].apply(lambda x: f"${x:,.2f}")
@@ -283,7 +273,6 @@ if not df_live.empty and not df_bt.empty:
             trade_df['Target (TP)'] = trade_df['Target (TP)'].apply(lambda x: f"${x:,.2f}")
             trade_df['Net P&L'] = trade_df['Net P&L'].apply(lambda x: f"${x:,.2f}")
             
-            # Render interactive table
             st.dataframe(trade_df, use_container_width=True, hide_index=True)
             
         else:
