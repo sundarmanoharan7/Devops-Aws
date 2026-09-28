@@ -92,9 +92,15 @@ bt_window = st.sidebar.slider("Structural Swing Lookback", min_value=5, max_valu
 # --- DATA FETCHING ---
 @st.cache_data(ttl=60)
 def fetch_market_data(anchor: float):
-    # Fetch pure XAUUSD Spot data history (No Futures)
-    df_live = yf.download("XAUUSD=X", period="14d", interval="15m", progress=False)
-    df_bt = yf.download("XAUUSD=X", period="6mo", interval="1h", progress=False)
+    # Inject a custom browser session to bypass Streamlit Cloud IP blocking
+    session = requests.Session()
+    session.headers.update({
+        'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36'
+    })
+
+    # Fetch pure XAUUSD Spot data history using the unblocked session
+    df_live = yf.download("XAUUSD=X", period="14d", interval="15m", progress=False, session=session)
+    df_bt = yf.download("XAUUSD=X", period="6mo", interval="1h", progress=False, session=session)
     
     for df in [df_live, df_bt]:
         if not df.empty:
@@ -340,4 +346,4 @@ if not df_live.empty and not df_bt.empty:
         else:
             st.warning("No trades triggered under current parameters.")
 else:
-    st.error("Market data feeds are currently unreachable.")
+    st.error("Market data feeds are currently unreachable. Streamlit Cloud is blocking yfinance downloads despite session injection.")
