@@ -4,49 +4,36 @@ import numpy as np
 from scipy.signal import argrelextrema
 import matplotlib.pyplot as plt
 import matplotlib.dates as mdates
-import requests
-import json
+from tvDatafeed import TvDatafeed, Interval
+import logging
+
+# Silence TradingView login warnings (Guest mode is fine for Forex/Spot)
+logging.getLogger('tvDatafeed').setLevel(logging.ERROR)
 
 st.set_page_config(page_title="SMC Live Trade & Backtest", layout="wide")
 st.title("Smart Money Concepts (SMC) - Live Setup & Backtest Engine")
 
-# --- CLOUD-RESILIENT REAL-TIME SPOT FETCHER ---
-@st.cache_data(ttl=20)
+# --- INITIALIZE TRADINGVIEW CONNECTION ---
+@st.cache_resource
+def get_tv_connection():
+    try:
+        return TvDatafeed()
+    except Exception:
+        return None
+
+tv = get_tv_connection()
+
+# --- REAL-TIME TRADINGVIEW SPOT FETCHER ---
+@st.cache_data(ttl=20)  # Refreshes every 20 seconds
 def get_live_xauusd_spot():
-    """
-    Fetches live Gold Spot directly from TradingView's public scanner 
-    (prioritizing the FXCM feed).
-    """
-    headers = {'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64)'}
-    payload = {
-        "symbols": {"tickers": ["FXCM:XAUUSD", "OANDA:XAUUSD"]},
-        "columns": ["close"]
-    }
-
-    try:
-        url = "https://scanner.tradingview.com/cfd/scan"
-        res = requests.post(url, json=payload, headers=headers, timeout=5)
-        if res.status_code == 200:
-            data = res.json()
-            if data.get('data'):
-                price = data['data'][0]['d'][0]
-                if price and float(price) > 1000:
-                    return float(price)
-    except Exception:
-        pass
-
-    try:
-        url = "https://scanner.tradingview.com/forex/scan"
-        res = requests.post(url, json=payload, headers=headers, timeout=5)
-        if res.status_code == 200:
-            data = res.json()
-            if data.get('data'):
-                price = data['data'][0]['d'][0]
-                if price and float(price) > 1000:
-                    return float(price)
-    except Exception:
-        pass
-
+    """Fetches exact live Gold Spot directly from TradingView FXCM."""
+    if tv is not None:
+        try:
+            df = tv.get_hist(symbol='XAUUSD', exchange='FXCM', interval=Interval.in_1_minute, n_bars=1)
+            if df is not None and not df.empty:
+                return float(df['close'].iloc[-1])
+        except Exception:
+            pass
     return 4197.50
 
 market_spot = get_live_xauusd_spot()
@@ -71,51 +58,31 @@ capital = st.sidebar.number_input("Starting Capital ($)", min_value=1000.0, max_
 risk_pct = st.sidebar.slider("Risk Per Trade (%)", min_value=0.5, max_value=5.0, value=2.0, step=0.5)
 bt_window = st.sidebar.slider("Structural Swing Lookback", min_value=5, max_value=30, value=15)
 
-# --- CUSTOM HISTORICAL DATA FETCHER (BYPASSES YFINANCE) ---
-def fetch_raw_historical_data(interval, period):
-    """Hits the raw Yahoo JSON endpoint directly to bypass yfinance library blocks."""
-    url = f"https://query2.finance.yahoo.com/v8/finance/chart/XAUUSD=X?interval={interval}&range={period}"
-    headers = {
-        'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36'
-    }
-    try:
-        res = requests.get(url, headers=headers, timeout=5)
-        if res.status_code == 200:
-            data = res.json()
-            result = data.get('chart', {}).get('result', [])
-            if result:
-                timestamps = result[0].get('timestamp', [])
-                quote = result[0].get('indicators', {}).get('quote', [{}])[0]
-                
-                df = pd.DataFrame({
-                    'Open': quote.get('open', []),
-                    'High': quote.get('high', []),
-                    'Low': quote.get('low', []),
-                    'Close': quote.get('close', [])
-                })
-                
-                df.index = pd.to_datetime(timestamps, unit='s', utc=True)
-                return df.dropna()
-    except Exception:
-        pass
-    return pd.DataFrame()
-
+# --- HISTORICAL TRADINGVIEW DATA FETCHER ---
 @st.cache_data(ttl=60)
-def fetch_market_data(anchor: float):
-    # Fetch pure XAUUSD Spot data history via direct REST API
-    df_live = fetch_raw_historical_data(interval="15m", period="14d")
-    df_bt = fetch_raw_historical_data(interval="1h", period="6mo")
-    
-    # Align the historical data perfectly with the live TradingView FXCM feed
-    if not df_live.empty:
-        active_historical_bar = float(df_live['Close'].iloc[-1])
-        spread = active_historical_bar - anchor
+def fetch_market_data():
+    """Downloads pure TradingView FXCM history, completely bypassing Yahoo Finance."""
+    if tv is None:
+        return pd.DataFrame(), pd.DataFrame()
+        
+    try:
+        # Fetch 1400 bars (approx 14 days of 15-minute data)
+        df_live = tv.get_hist(symbol='XAUUSD', exchange='FXCM', interval=Interval.in_15_minute, n_bars=1400)
+        # Fetch 4500 bars (approx 6 months of 1-hour data)
+        df_bt = tv.get_hist(symbol='XAUUSD', exchange='FXCM', interval=Interval.in_1_hour, n_bars=4500)
+        
         for df in [df_live, df_bt]:
-            if not df.empty:
-                for col in ['Open', 'High', 'Low', 'Close']:
-                    df[col] = df[col] - spread
+            if df is not None and not df.empty:
+                # Standardize TV columns to match our script
+                df.rename(columns={'open': 'Open', 'high': 'High', 'low': 'Low', 'close': 'Close'}, inplace=True)
+                if df.index.tz is None:
+                    df.index = df.index.tz_localize('UTC')
+                else:
+                    df.index = df.index.tz_convert('UTC')
                     
-    return df_live, df_bt
+        return df_live, df_bt
+    except Exception:
+        return pd.DataFrame(), pd.DataFrame()
 
 # --- SMC STRUCTURAL LOGIC ---
 def analyze_smc_structure(df, window=12):
@@ -234,9 +201,9 @@ def run_backtest(df, start_capital, risk, window):
     return trades, dates, equity_curve
 
 # --- RENDER DASHBOARD ---
-df_live, df_bt = fetch_market_data(live_spot)
+df_live, df_bt = fetch_market_data()
 
-if not df_live.empty and not df_bt.empty:
+if df_live is not None and not df_live.empty and df_bt is not None and not df_bt.empty:
     tab1, tab2 = st.tabs(["🔴 Live Market Execution", "📊 6-Month Backtest Results"])
     
     with tab1:
@@ -341,4 +308,4 @@ if not df_live.empty and not df_bt.empty:
         else:
             st.warning("No trades triggered under current parameters.")
 else:
-    st.error("Market data feeds are currently unreachable. Streamlit Cloud is blocking direct JSON downloads.")
+    st.error("TradingView market feeds are currently unreachable. Please ensure 'tvdatafeed' is installed.")
