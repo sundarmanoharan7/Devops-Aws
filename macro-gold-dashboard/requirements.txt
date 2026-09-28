@@ -9,3 +9,4 @@ scipy
 matplotlib
 requests
 tvdatafeed
+tradingview-datafeed
