@@ -11,20 +11,36 @@ import json
 st.set_page_config(page_title="SMC Live Trade & Backtest", layout="wide")
 st.title("Smart Money Concepts (SMC) - Live Setup & Backtest Engine")
 
-# --- CLOUD-RESILIENT REAL-TIME SPOT FETCHER ---
+# --- CLOUD-RESILIENT REAL-TIME FUTURES FETCHER ---
 @st.cache_data(ttl=20)  # Refreshes every 20 seconds
-def get_live_xauusd_spot():
+def get_live_gold_futures():
     """
-    Cloud-resilient spot fetcher that queries direct market JSON endpoints
-    bypassing Streamlit Cloud IP blocking.
+    Fetches live Gold Futures (COMEX:GC1!) directly from TradingView's public scanner.
+    This bypasses Yahoo Finance's strict Streamlit Cloud IP blocking and 
+    fetches the active Futures contract instead of the Spot price.
     """
-    headers = {
-        'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36'
-    }
-
-    # Source 1: Direct Yahoo v8 JSON query with custom session headers (bypasses yfinance wrapper block)
+    # Source 1: TradingView Scanner API (Unblocked on Cloud)
     try:
-        url = "https://query1.finance.yahoo.com/v8/finance/chart/XAUUSD=X?interval=1m&range=1d"
+        url = "https://scanner.tradingview.com/america/scan"
+        payload = {
+            "symbols": {"tickers": ["COMEX:GC1!"]},
+            "columns": ["close"]
+        }
+        headers = {'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64)'}
+        res = requests.post(url, json=payload, headers=headers, timeout=5)
+        if res.status_code == 200:
+            data = res.json()
+            if data.get('data'):
+                price = data['data'][0]['d'][0]
+                if price and float(price) > 1000:
+                    return float(price)
+    except Exception:
+        pass
+
+    # Source 2: Yahoo Finance Direct JSON (GC=F)
+    try:
+        url = "https://query1.finance.yahoo.com/v8/finance/chart/GC=F?interval=1m&range=1d"
+        headers = {'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64)'}
         res = requests.get(url, headers=headers, timeout=3)
         if res.status_code == 200:
             data = res.json()
@@ -34,46 +50,25 @@ def get_live_xauusd_spot():
     except Exception:
         pass
 
-    # Source 2: Alternative Free Public Gold Spot API
-    try:
-        url = "https://api.metals.live/v1/spot/gold"
-        res = requests.get(url, headers=headers, timeout=3)
-        if res.status_code == 200:
-            data = res.json()
-            price = data[0].get('price') if isinstance(data, list) else data.get('price')
-            if price and float(price) > 1000:
-                return float(price)
-    except Exception:
-        pass
-
-    # Source 3: yfinance fast_info fallback
-    try:
-        t = yf.Ticker("XAUUSD=X")
-        price = t.fast_info.get('lastPrice')
-        if price and float(price) > 1000:
-            return float(price)
-    except Exception:
-        pass
-
-    # Last known TradingView FXCM market baseline
+    # Last known emergency baseline
     return 4285.00
 
-market_spot = get_live_xauusd_spot()
+market_price = get_live_gold_futures()
 
 # --- SIDEBAR CONTROLS ---
 st.sidebar.header("Live Feed Synchronization")
 manual_override = st.sidebar.checkbox("Override Live Feed (Manual Mode)", value=False)
 
 if manual_override:
-    live_spot = st.sidebar.number_input(
-        "Manual MT5 Spot Price (USD)",
+    live_price = st.sidebar.number_input(
+        "Manual MT5 Futures Price (USD)",
         min_value=1000.0, max_value=10000.0,
-        value=float(round(market_spot, 2)), step=0.10
+        value=float(round(market_price, 2)), step=0.10
     )
     st.sidebar.warning("Manual Override Active. Uncheck to resume live sync.")
 else:
-    live_spot = market_spot
-    st.sidebar.success(f"Live Sync Active\n\n**Current Spot: ${live_spot:,.2f}**")
+    live_price = market_price
+    st.sidebar.success(f"Live Sync Active\n\n**Current Futures Price: ${live_price:,.2f}**")
 
 st.sidebar.header("Backtest Parameters")
 capital = st.sidebar.number_input("Starting Capital ($)", min_value=1000.0, max_value=100000.0, value=15000.0, step=1000.0)
@@ -95,13 +90,14 @@ def fetch_market_data(anchor: float):
             else:
                 df.index = df.index.tz_convert('UTC')
                 
+    # Align the historical data perfectly with the live TradingView feed
     if not df_live.empty:
-        active_futures_bar = float(df_live['Close'].dropna().iloc[-1])
-        futures_spread = active_futures_bar - anchor
+        active_historical_bar = float(df_live['Close'].dropna().iloc[-1])
+        spread = active_historical_bar - anchor
         for df in [df_live, df_bt]:
             if not df.empty:
                 for col in ['Open', 'High', 'Low', 'Close']:
-                    df[col] = df[col] - futures_spread
+                    df[col] = df[col] - spread
                     
     return df_live, df_bt
 
@@ -222,16 +218,16 @@ def run_backtest(df, start_capital, risk, window):
     return trades, dates, equity_curve
 
 # --- RENDER DASHBOARD ---
-df_live, df_bt = fetch_market_data(live_spot)
+df_live, df_bt = fetch_market_data(live_price)
 
 if not df_live.empty and not df_bt.empty:
     tab1, tab2 = st.tabs(["🔴 Live Market Execution", "📊 6-Month Backtest Results"])
     
     with tab1:
-        current_price = live_spot 
+        current_price = live_price 
         swing_high, swing_low, eq, gz_low, gz_high = analyze_smc_structure(df_live)
         
-        st.subheader(f"Active Live Spot Price: ${current_price:,.2f}")
+        st.subheader(f"Active Live Futures Price (GC=F): ${current_price:,.2f}")
         
         col1, col2 = st.columns(2)
         with col1:
@@ -245,7 +241,6 @@ if not df_live.empty and not df_bt.empty:
 
         with col2:
             st.markdown("### SMC Execution Plan")
-            # Dynamically update the execution plan based on whether we are looking for a Long or Short
             if current_price > eq:
                 st.write(f"**Optimal Short Entry Zone:** ${gz_low:,.2f} – ${gz_high:,.2f}")
                 st.write(f"**Stop Loss:** ${swing_high + 2.50:,.2f}")
@@ -262,12 +257,11 @@ if not df_live.empty and not df_bt.empty:
         
         df_chart = df_live.tail(150)
         fig, ax = plt.subplots(figsize=(14, 6))
-        ax.plot(df_chart.index, df_chart['Close'], color='black', linewidth=1.2, label="Spot Price")
+        ax.plot(df_chart.index, df_chart['Close'], color='black', linewidth=1.2, label="Futures Price")
         
         ax.axhspan(eq, swing_high, color='red', alpha=0.06, label="Premium Zone")
         ax.axhspan(swing_low, eq, color='green', alpha=0.06, label="Discount Zone")
         
-        # Shade both Short and Long OTE zones for full visual context
         ax.axhspan(gz_low, gz_high, color='darkred', alpha=0.25, label="OTE Supply (Short) Zone")
         
         long_ote_high_chart = swing_low + ((swing_high - swing_low) * 0.382)
@@ -279,7 +273,7 @@ if not df_live.empty and not df_bt.empty:
         ax.axhline(eq, color='blue', linestyle=':', linewidth=1.4, label=f"Equilibrium (${eq:,.2f})")
         
         ax.xaxis.set_major_formatter(mdates.DateFormatter('%b %d\n%H:%M UTC'))
-        ax.set_ylabel('Spot Price (USD)')
+        ax.set_ylabel('Futures Price (USD)')
         ax.legend(loc='upper right', bbox_to_anchor=(1.25, 1))
         ax.grid(alpha=0.25)
         st.pyplot(fig)
@@ -312,7 +306,6 @@ if not df_live.empty and not df_bt.empty:
             ax2.grid(alpha=0.25)
             st.pyplot(fig2)
             
-            # --- DETAILED TRADE LOG UI ---
             st.divider()
             st.subheader("📝 Detailed Trade Ledger")
             
@@ -324,7 +317,6 @@ if not df_live.empty and not df_bt.empty:
             trade_df['Target (TP)'] = trade_df['Target (TP)'].apply(lambda x: f"${x:,.2f}")
             trade_df['Net P&L'] = trade_df['Net P&L'].apply(lambda x: f"${x:,.2f}")
             
-            # Arrange columns for readability
             cols = ['Entry Date', 'Exit Date', 'Type', 'Result', 'Entry Price', 'Stop Loss', 'Target (TP)', 'Net P&L']
             trade_df = trade_df[cols]
             
