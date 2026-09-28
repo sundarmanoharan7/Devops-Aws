@@ -11,22 +11,24 @@ import json
 st.set_page_config(page_title="SMC Live Trade & Backtest", layout="wide")
 st.title("Smart Money Concepts (SMC) - Live Setup & Backtest Engine")
 
-# --- CLOUD-RESILIENT REAL-TIME FUTURES FETCHER ---
+# --- CLOUD-RESILIENT REAL-TIME SPOT FETCHER ---
 @st.cache_data(ttl=20)  # Refreshes every 20 seconds
-def get_live_gold_futures():
+def get_live_xauusd_spot():
     """
-    Fetches live Gold Futures (COMEX:GC1!) directly from TradingView's public scanner.
-    This bypasses Yahoo Finance's strict Streamlit Cloud IP blocking and 
-    fetches the active Futures contract instead of the Spot price.
+    Fetches live Gold Spot directly from TradingView's public scanner 
+    (prioritizing the FXCM feed), bypassing Yahoo Finance entirely.
     """
-    # Source 1: TradingView Scanner API (Unblocked on Cloud)
+    headers = {'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64)'}
+    
+    # Payload targeting the exact TradingView FXCM / OANDA spot feeds
+    payload = {
+        "symbols": {"tickers": ["FXCM:XAUUSD", "OANDA:XAUUSD"]},
+        "columns": ["close"]
+    }
+
+    # Attempt 1: TradingView CFD Scanner
     try:
-        url = "https://scanner.tradingview.com/america/scan"
-        payload = {
-            "symbols": {"tickers": ["COMEX:GC1!"]},
-            "columns": ["close"]
-        }
-        headers = {'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64)'}
+        url = "https://scanner.tradingview.com/cfd/scan"
         res = requests.post(url, json=payload, headers=headers, timeout=5)
         if res.status_code == 200:
             data = res.json()
@@ -37,10 +39,22 @@ def get_live_gold_futures():
     except Exception:
         pass
 
-    # Source 2: Yahoo Finance Direct JSON (GC=F)
+    # Attempt 2: TradingView Forex Scanner
     try:
-        url = "https://query1.finance.yahoo.com/v8/finance/chart/GC=F?interval=1m&range=1d"
-        headers = {'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64)'}
+        url = "https://scanner.tradingview.com/forex/scan"
+        res = requests.post(url, json=payload, headers=headers, timeout=5)
+        if res.status_code == 200:
+            data = res.json()
+            if data.get('data'):
+                price = data['data'][0]['d'][0]
+                if price and float(price) > 1000:
+                    return float(price)
+    except Exception:
+        pass
+
+    # Attempt 3: Yahoo Finance Direct JSON (XAUUSD=X Spot) Fallback
+    try:
+        url = "https://query1.finance.yahoo.com/v8/finance/chart/XAUUSD=X?interval=1m&range=1d"
         res = requests.get(url, headers=headers, timeout=3)
         if res.status_code == 200:
             data = res.json()
@@ -50,25 +64,25 @@ def get_live_gold_futures():
     except Exception:
         pass
 
-    # Last known emergency baseline
-    return 4285.00
+    # Last known fallback
+    return 4197.50
 
-market_price = get_live_gold_futures()
+market_spot = get_live_xauusd_spot()
 
 # --- SIDEBAR CONTROLS ---
 st.sidebar.header("Live Feed Synchronization")
 manual_override = st.sidebar.checkbox("Override Live Feed (Manual Mode)", value=False)
 
 if manual_override:
-    live_price = st.sidebar.number_input(
-        "Manual MT5 Futures Price (USD)",
+    live_spot = st.sidebar.number_input(
+        "Manual MT5 Spot Price (USD)",
         min_value=1000.0, max_value=10000.0,
-        value=float(round(market_price, 2)), step=0.10
+        value=float(round(market_spot, 2)), step=0.10
     )
     st.sidebar.warning("Manual Override Active. Uncheck to resume live sync.")
 else:
-    live_price = market_price
-    st.sidebar.success(f"Live Sync Active\n\n**Current Futures Price: ${live_price:,.2f}**")
+    live_spot = market_spot
+    st.sidebar.success(f"Live Sync Active\n\n**Current Spot: ${live_spot:,.2f}**")
 
 st.sidebar.header("Backtest Parameters")
 capital = st.sidebar.number_input("Starting Capital ($)", min_value=1000.0, max_value=100000.0, value=15000.0, step=1000.0)
@@ -78,8 +92,9 @@ bt_window = st.sidebar.slider("Structural Swing Lookback", min_value=5, max_valu
 # --- DATA FETCHING ---
 @st.cache_data(ttl=60)
 def fetch_market_data(anchor: float):
-    df_live = yf.download("GC=F", period="14d", interval="15m", progress=False)
-    df_bt = yf.download("GC=F", period="6mo", interval="1h", progress=False)
+    # Fetch pure XAUUSD Spot data history (No Futures)
+    df_live = yf.download("XAUUSD=X", period="14d", interval="15m", progress=False)
+    df_bt = yf.download("XAUUSD=X", period="6mo", interval="1h", progress=False)
     
     for df in [df_live, df_bt]:
         if not df.empty:
@@ -90,7 +105,7 @@ def fetch_market_data(anchor: float):
             else:
                 df.index = df.index.tz_convert('UTC')
                 
-    # Align the historical data perfectly with the live TradingView feed
+    # Align the historical data perfectly with the live TradingView FXCM feed
     if not df_live.empty:
         active_historical_bar = float(df_live['Close'].dropna().iloc[-1])
         spread = active_historical_bar - anchor
@@ -218,16 +233,16 @@ def run_backtest(df, start_capital, risk, window):
     return trades, dates, equity_curve
 
 # --- RENDER DASHBOARD ---
-df_live, df_bt = fetch_market_data(live_price)
+df_live, df_bt = fetch_market_data(live_spot)
 
 if not df_live.empty and not df_bt.empty:
     tab1, tab2 = st.tabs(["🔴 Live Market Execution", "📊 6-Month Backtest Results"])
     
     with tab1:
-        current_price = live_price 
+        current_price = live_spot 
         swing_high, swing_low, eq, gz_low, gz_high = analyze_smc_structure(df_live)
         
-        st.subheader(f"Active Live Futures Price (GC=F): ${current_price:,.2f}")
+        st.subheader(f"Active Live Spot Price (TV): ${current_price:,.2f}")
         
         col1, col2 = st.columns(2)
         with col1:
@@ -257,7 +272,7 @@ if not df_live.empty and not df_bt.empty:
         
         df_chart = df_live.tail(150)
         fig, ax = plt.subplots(figsize=(14, 6))
-        ax.plot(df_chart.index, df_chart['Close'], color='black', linewidth=1.2, label="Futures Price")
+        ax.plot(df_chart.index, df_chart['Close'], color='black', linewidth=1.2, label="Spot Price")
         
         ax.axhspan(eq, swing_high, color='red', alpha=0.06, label="Premium Zone")
         ax.axhspan(swing_low, eq, color='green', alpha=0.06, label="Discount Zone")
@@ -273,7 +288,7 @@ if not df_live.empty and not df_bt.empty:
         ax.axhline(eq, color='blue', linestyle=':', linewidth=1.4, label=f"Equilibrium (${eq:,.2f})")
         
         ax.xaxis.set_major_formatter(mdates.DateFormatter('%b %d\n%H:%M UTC'))
-        ax.set_ylabel('Futures Price (USD)')
+        ax.set_ylabel('Spot Price (USD)')
         ax.legend(loc='upper right', bbox_to_anchor=(1.25, 1))
         ax.grid(alpha=0.25)
         st.pyplot(fig)
