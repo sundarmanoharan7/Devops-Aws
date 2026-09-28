@@ -1,5 +1,4 @@
 import streamlit as st
-import yfinance as yf
 import pandas as pd
 import numpy as np
 from scipy.signal import argrelextrema
@@ -12,21 +11,18 @@ st.set_page_config(page_title="SMC Live Trade & Backtest", layout="wide")
 st.title("Smart Money Concepts (SMC) - Live Setup & Backtest Engine")
 
 # --- CLOUD-RESILIENT REAL-TIME SPOT FETCHER ---
-@st.cache_data(ttl=20)  # Refreshes every 20 seconds
+@st.cache_data(ttl=20)
 def get_live_xauusd_spot():
     """
     Fetches live Gold Spot directly from TradingView's public scanner 
-    (prioritizing the FXCM feed), bypassing Yahoo Finance entirely.
+    (prioritizing the FXCM feed).
     """
     headers = {'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64)'}
-    
-    # Payload targeting the exact TradingView FXCM / OANDA spot feeds
     payload = {
         "symbols": {"tickers": ["FXCM:XAUUSD", "OANDA:XAUUSD"]},
         "columns": ["close"]
     }
 
-    # Attempt 1: TradingView CFD Scanner
     try:
         url = "https://scanner.tradingview.com/cfd/scan"
         res = requests.post(url, json=payload, headers=headers, timeout=5)
@@ -39,7 +35,6 @@ def get_live_xauusd_spot():
     except Exception:
         pass
 
-    # Attempt 2: TradingView Forex Scanner
     try:
         url = "https://scanner.tradingview.com/forex/scan"
         res = requests.post(url, json=payload, headers=headers, timeout=5)
@@ -52,19 +47,6 @@ def get_live_xauusd_spot():
     except Exception:
         pass
 
-    # Attempt 3: Yahoo Finance Direct JSON (XAUUSD=X Spot) Fallback
-    try:
-        url = "https://query1.finance.yahoo.com/v8/finance/chart/XAUUSD=X?interval=1m&range=1d"
-        res = requests.get(url, headers=headers, timeout=3)
-        if res.status_code == 200:
-            data = res.json()
-            price = data['chart']['result'][0]['meta'].get('regularMarketPrice')
-            if price and float(price) > 1000:
-                return float(price)
-    except Exception:
-        pass
-
-    # Last known fallback
     return 4197.50
 
 market_spot = get_live_xauusd_spot()
@@ -89,31 +71,44 @@ capital = st.sidebar.number_input("Starting Capital ($)", min_value=1000.0, max_
 risk_pct = st.sidebar.slider("Risk Per Trade (%)", min_value=0.5, max_value=5.0, value=2.0, step=0.5)
 bt_window = st.sidebar.slider("Structural Swing Lookback", min_value=5, max_value=30, value=15)
 
-# --- DATA FETCHING ---
+# --- CUSTOM HISTORICAL DATA FETCHER (BYPASSES YFINANCE) ---
+def fetch_raw_historical_data(interval, period):
+    """Hits the raw Yahoo JSON endpoint directly to bypass yfinance library blocks."""
+    url = f"https://query2.finance.yahoo.com/v8/finance/chart/XAUUSD=X?interval={interval}&range={period}"
+    headers = {
+        'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36'
+    }
+    try:
+        res = requests.get(url, headers=headers, timeout=5)
+        if res.status_code == 200:
+            data = res.json()
+            result = data.get('chart', {}).get('result', [])
+            if result:
+                timestamps = result[0].get('timestamp', [])
+                quote = result[0].get('indicators', {}).get('quote', [{}])[0]
+                
+                df = pd.DataFrame({
+                    'Open': quote.get('open', []),
+                    'High': quote.get('high', []),
+                    'Low': quote.get('low', []),
+                    'Close': quote.get('close', [])
+                })
+                
+                df.index = pd.to_datetime(timestamps, unit='s', utc=True)
+                return df.dropna()
+    except Exception:
+        pass
+    return pd.DataFrame()
+
 @st.cache_data(ttl=60)
 def fetch_market_data(anchor: float):
-    # Inject a custom browser session to bypass Streamlit Cloud IP blocking
-    session = requests.Session()
-    session.headers.update({
-        'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36'
-    })
-
-    # Fetch pure XAUUSD Spot data history using the unblocked session
-    df_live = yf.download("XAUUSD=X", period="14d", interval="15m", progress=False, session=session)
-    df_bt = yf.download("XAUUSD=X", period="6mo", interval="1h", progress=False, session=session)
+    # Fetch pure XAUUSD Spot data history via direct REST API
+    df_live = fetch_raw_historical_data(interval="15m", period="14d")
+    df_bt = fetch_raw_historical_data(interval="1h", period="6mo")
     
-    for df in [df_live, df_bt]:
-        if not df.empty:
-            if isinstance(df.columns, pd.MultiIndex):
-                df.columns = df.columns.get_level_values(0)
-            if df.index.tz is None:
-                df.index = df.index.tz_localize('UTC')
-            else:
-                df.index = df.index.tz_convert('UTC')
-                
     # Align the historical data perfectly with the live TradingView FXCM feed
     if not df_live.empty:
-        active_historical_bar = float(df_live['Close'].dropna().iloc[-1])
+        active_historical_bar = float(df_live['Close'].iloc[-1])
         spread = active_historical_bar - anchor
         for df in [df_live, df_bt]:
             if not df.empty:
@@ -346,4 +341,4 @@ if not df_live.empty and not df_bt.empty:
         else:
             st.warning("No trades triggered under current parameters.")
 else:
-    st.error("Market data feeds are currently unreachable. Streamlit Cloud is blocking yfinance downloads despite session injection.")
+    st.error("Market data feeds are currently unreachable. Streamlit Cloud is blocking direct JSON downloads.")
