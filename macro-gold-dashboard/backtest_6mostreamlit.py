@@ -60,7 +60,7 @@ def get_live_xauusd_spot():
     except: pass
 
     # Failsafe baseline
-    return 4197.50
+    return 4150.00
 
 market_spot = get_live_xauusd_spot()
 
@@ -85,12 +85,12 @@ risk_pct = st.sidebar.slider("Risk Per Trade (%)", min_value=0.5, max_value=5.0,
 bt_window = st.sidebar.slider("Structural Swing Lookback", min_value=5, max_value=30, value=15)
 
 # --- BULLETPROOF HISTORICAL DATA FETCHER ---
-@st.cache_data(ttl=300) # 5-min cache to prevent rate limits
+@st.cache_data(ttl=300)
 def fetch_market_data(anchor: float):
     """Multi-tiered cascade to guarantee data fetching regardless of Streamlit Cloud IP blocks."""
     df_live, df_bt = pd.DataFrame(), pd.DataFrame()
 
-    # ATTEMPT 1: TradingView API (Iterating through unblocked exchanges)
+    # ATTEMPT 1: TradingView API
     if tv is not None:
         exchanges = ['OANDA', 'FXCM', 'FOREXCOM']
         for exc in exchanges:
@@ -100,7 +100,7 @@ def fetch_market_data(anchor: float):
                 if df_live is not None and not df_live.empty: break
             except: continue
 
-    # ATTEMPT 2: Bitfinex Public API (tXAUUSD Spot Gold - Unblockable)
+    # ATTEMPT 2: Bitfinex Public API (tXAUUSD Spot Gold)
     if df_live is None or df_live.empty or df_bt is None or df_bt.empty:
         try:
             r15 = requests.get("https://api-pub.bitfinex.com/v2/candles/trade:15m:tXAUUSD/hist?limit=1500", timeout=5)
@@ -116,7 +116,7 @@ def fetch_market_data(anchor: float):
                 df_bt = d1h[['time', 'open', 'high', 'low', 'close']].set_index('time').astype(float).sort_index()
         except: pass
 
-    # ATTEMPT 3: MEXC PAXGUSDT (Binance-clone API, 100% US Cloud Friendly)
+    # ATTEMPT 3: MEXC PAXGUSDT
     if df_live is None or df_live.empty or df_bt is None or df_bt.empty:
         try:
             res_15 = requests.get("https://api.mexc.com/api/v3/klines?symbol=PAXGUSDT&interval=15m&limit=1000", timeout=5).json()
@@ -149,7 +149,6 @@ def fetch_market_data(anchor: float):
             else:
                 df.index = df.index.tz_convert('UTC')
 
-        # Offset Alignment: Anchors whichever fallback we hit perfectly to the live TV Spot Price
         active_historical_bar = float(df_live['Close'].dropna().iloc[-1])
         spread = active_historical_bar - anchor
         for df in [df_live, df_bt]:
@@ -180,14 +179,13 @@ def analyze_smc_structure(df, window=12):
     
     return recent_high, recent_low, equilibrium, golden_zone_low, golden_zone_high
 
-# --- BACKTESTING ENGINE (LONG & SHORT SUPPORT) ---
+# --- BACKTESTING ENGINE (SHORT-ONLY SUPPORT) ---
 def run_backtest(df, start_capital, risk, window):
     df = df.copy()
     df['Swing_High'] = df['High'].rolling(window=window*2, center=True).max().ffill()
     df['Swing_Low'] = df['Low'].rolling(window=window*2, center=True).min().ffill()
     
     in_trade = False
-    trade_type = None  
     entry_price, stop_loss, take_profit = 0.0, 0.0, 0.0
     entry_date = None
     
@@ -215,58 +213,28 @@ def run_backtest(df, start_capital, risk, window):
         short_ote_low = high - (total_range * 0.382)
         short_ote_high = high - (total_range * 0.214)
         
-        # Discount Demand (Long) Zone
-        long_ote_high = low + (total_range * 0.382)
-        long_ote_low = low + (total_range * 0.214)
-        
         if not in_trade:
-            # 1. Bearish Setup (Short)
+            # Bearish Setup (Short) Only
             if (short_ote_low <= close <= short_ote_high) and close > eq:
                 in_trade = True
-                trade_type = 'Short'
                 entry_price = close
                 stop_loss = high + 2.50
                 take_profit = low
                 entry_date = date
                 
-            # 2. Bullish Setup (Long)
-            elif (long_ote_low <= close <= long_ote_high) and close < eq:
-                in_trade = True
-                trade_type = 'Long'
-                entry_price = close
-                stop_loss = low - 2.50
-                take_profit = high
-                entry_date = date
-                
         elif in_trade:
             risk_amt = equity * (risk / 100)
-            
-            # SHORT EXITS
-            if trade_type == 'Short':
-                if curr_high >= stop_loss:  
-                    equity -= risk_amt
-                    trades.append({'Entry Date': entry_date, 'Exit Date': date, 'Type': 'Short', 'Result': 'Loss', 'Entry Price': entry_price, 'Stop Loss': stop_loss, 'Target (TP)': take_profit, 'Net P&L': -risk_amt})
-                    in_trade = False
-                elif curr_low <= take_profit:  
-                    reward_ratio = (entry_price - take_profit) / (stop_loss - entry_price)
-                    win_amt = risk_amt * reward_ratio
-                    equity += win_amt
-                    trades.append({'Entry Date': entry_date, 'Exit Date': date, 'Type': 'Short', 'Result': 'Win', 'Entry Price': entry_price, 'Stop Loss': stop_loss, 'Target (TP)': take_profit, 'Net P&L': win_amt})
-                    in_trade = False
-                    
-            # LONG EXITS
-            elif trade_type == 'Long':
-                if curr_low <= stop_loss:  
-                    equity -= risk_amt
-                    trades.append({'Entry Date': entry_date, 'Exit Date': date, 'Type': 'Long', 'Result': 'Loss', 'Entry Price': entry_price, 'Stop Loss': stop_loss, 'Target (TP)': take_profit, 'Net P&L': -risk_amt})
-                    in_trade = False
-                elif curr_high >= take_profit:  
-                    reward_ratio = (take_profit - entry_price) / (entry_price - stop_loss)
-                    win_amt = risk_amt * reward_ratio
-                    equity += win_amt
-                    trades.append({'Entry Date': entry_date, 'Exit Date': date, 'Type': 'Long', 'Result': 'Win', 'Entry Price': entry_price, 'Stop Loss': stop_loss, 'Target (TP)': take_profit, 'Net P&L': win_amt})
-                    in_trade = False
-                    
+            if curr_high >= stop_loss:  
+                equity -= risk_amt
+                trades.append({'Entry Date': entry_date, 'Exit Date': date, 'Type': 'Short', 'Result': 'Loss', 'Entry Price': entry_price, 'Stop Loss': stop_loss, 'Target (TP)': take_profit, 'Net P&L': -risk_amt})
+                in_trade = False
+            elif curr_low <= take_profit:  
+                reward_ratio = (entry_price - take_profit) / (stop_loss - entry_price)
+                win_amt = risk_amt * reward_ratio
+                equity += win_amt
+                trades.append({'Entry Date': entry_date, 'Exit Date': date, 'Type': 'Short', 'Result': 'Win', 'Entry Price': entry_price, 'Stop Loss': stop_loss, 'Target (TP)': take_profit, 'Net P&L': win_amt})
+                in_trade = False
+                
             if not in_trade:
                 equity_curve.append(equity)
                 dates.append(date)
@@ -295,22 +263,15 @@ if df_live is not None and not df_live.empty and df_bt is not None and not df_bt
             st.write(f"**Swing High (BSL):** ${swing_high:,.2f}")
             st.write(f"**Equilibrium (50%):** ${eq:,.2f}")
             st.write(f"**Swing Low (SSL):** ${swing_low:,.2f}")
-            status = "PREMIUM (Sell Allowed)" if current_price > eq else "DISCOUNT (Buy Allowed)"
+            status = "PREMIUM (Sell Allowed)" if current_price > eq else "DISCOUNT (Wait for Retracement)"
             badge_color = "red" if current_price > eq else "green"
             st.markdown(f"**Market Valuation:** :{badge_color}[{status}]")
 
         with col2:
-            st.markdown("### SMC Execution Plan")
-            if current_price > eq:
-                st.write(f"**Optimal Short Entry Zone:** ${gz_low:,.2f} – ${gz_high:,.2f}")
-                st.write(f"**Stop Loss:** ${swing_high + 2.50:,.2f}")
-                st.write(f"**Take Profit:** ${swing_low:,.2f}")
-            else:
-                long_ote_high = swing_low + ((swing_high - swing_low) * 0.382)
-                long_ote_low = swing_low + ((swing_high - swing_low) * 0.214)
-                st.write(f"**Optimal Long Entry Zone:** ${long_ote_low:,.2f} – ${long_ote_high:,.2f}")
-                st.write(f"**Stop Loss:** ${swing_low - 2.50:,.2f}")
-                st.write(f"**Take Profit:** ${swing_high:,.2f}")
+            st.markdown("### SMC Execution Plan (Short-Only)")
+            st.write(f"**Optimal Short Entry Zone:** ${gz_low:,.2f} – ${gz_high:,.2f}")
+            st.write(f"**Stop Loss:** ${swing_high + 2.50:,.2f}")
+            st.write(f"**Take Profit:** ${swing_low:,.2f}")
             
         st.divider()
         st.subheader("15-Minute SMC Market Structure")
@@ -323,10 +284,6 @@ if df_live is not None and not df_live.empty and df_bt is not None and not df_bt
         ax.axhspan(swing_low, eq, color='green', alpha=0.06, label="Discount Zone")
         
         ax.axhspan(gz_low, gz_high, color='darkred', alpha=0.25, label="OTE Supply (Short) Zone")
-        
-        long_ote_high_chart = swing_low + ((swing_high - swing_low) * 0.382)
-        long_ote_low_chart = swing_low + ((swing_high - swing_low) * 0.214)
-        ax.axhspan(long_ote_low_chart, long_ote_high_chart, color='darkgreen', alpha=0.25, label="OTE Demand (Long) Zone")
         
         ax.axhline(swing_high, color='red', linestyle='--', linewidth=1.8, label=f"BSL Stop (${swing_high:,.2f})")
         ax.axhline(swing_low, color='green', linestyle='--', linewidth=1.8, label=f"SSL Target (${swing_low:,.2f})")
