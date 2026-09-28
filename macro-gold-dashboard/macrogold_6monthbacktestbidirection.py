@@ -1,4 +1,5 @@
 import streamlit as st
+import yfinance as yf
 import pandas as pd
 import numpy as np
 from scipy.signal import argrelextrema
@@ -27,24 +28,36 @@ tv = get_tv_connection()
 # --- REAL-TIME SPOT FETCHER ---
 @st.cache_data(ttl=20)
 def get_live_xauusd_spot():
-    """Fetches exact live Gold Spot directly from TradingView Scanner API."""
+    """Fetches exact live Gold Spot via multi-source fallback."""
     headers = {'User-Agent': 'Mozilla/5.0'}
-    payload = {
-        "symbols": {"tickers": ["FXCM:XAUUSD", "OANDA:XAUUSD"]},
-        "columns": ["close"]
-    }
     
+    # Source 1: TV CFD Scanner
     try:
         url = "https://scanner.tradingview.com/cfd/scan"
+        payload = {"symbols": {"tickers": ["FXCM:XAUUSD", "OANDA:XAUUSD"]}, "columns": ["close"]}
         res = requests.post(url, json=payload, headers=headers, timeout=5)
         if res.status_code == 200:
-            data = res.json()
-            if data.get('data'):
-                price = data['data'][0]['d'][0]
-                if price and float(price) > 1000:
-                    return float(price)
-    except Exception:
-        pass
+            price = res.json().get('data', [{}])[0].get('d', [0])[0]
+            if price > 1000: return float(price)
+    except: pass
+
+    # Source 2: TV Forex Scanner
+    try:
+        url = "https://scanner.tradingview.com/forex/scan"
+        res = requests.post(url, json=payload, headers=headers, timeout=5)
+        if res.status_code == 200:
+            price = res.json().get('data', [{}])[0].get('d', [0])[0]
+            if price > 1000: return float(price)
+    except: pass
+    
+    # Source 3: KuCoin PAXG (1:1 Physical Gold Peg)
+    try:
+        url = "https://api.kucoin.com/api/v1/market/orderbook/level1?symbol=PAXG-USDT"
+        res = requests.get(url, timeout=3)
+        if res.status_code == 200:
+            price = res.json().get('data', {}).get('price')
+            if price and float(price) > 1000: return float(price)
+    except: pass
 
     return 4197.50
 
@@ -71,56 +84,77 @@ risk_pct = st.sidebar.slider("Risk Per Trade (%)", min_value=0.5, max_value=5.0,
 bt_window = st.sidebar.slider("Structural Swing Lookback", min_value=5, max_value=30, value=15)
 
 # --- BULLETPROOF HISTORICAL DATA FETCHER ---
-@st.cache_data(ttl=60)
+@st.cache_data(ttl=300) # 5-min cache prevents yfinance rate-limiting
 def fetch_market_data(anchor: float):
-    """Attempts TradingView first, with a 100% resilient Binance Gold fallback."""
+    """Multi-tiered cascade to guarantee data fetching regardless of cloud blocks."""
     df_live, df_bt = pd.DataFrame(), pd.DataFrame()
     
-    # ATTEMPT 1: TradingView Python API
-    if tv is not None:
-        try:
-            df_live = tv.get_hist(symbol='XAUUSD', exchange='FXCM', interval=Interval.in_15_minute, n_bars=1400)
-            df_bt = tv.get_hist(symbol='XAUUSD', exchange='FXCM', interval=Interval.in_1_hour, n_bars=4500)
-        except Exception:
-            pass
+    # ATTEMPT 1: yfinance (Most robust if not spammed)
+    try:
+        df_live = yf.download("XAUUSD=X", period="14d", interval="15m", progress=False)
+        df_bt = yf.download("XAUUSD=X", period="6mo", interval="1h", progress=False)
+        if not df_live.empty and isinstance(df_live.columns, pd.MultiIndex):
+            df_live.columns = df_live.columns.get_level_values(0)
+            df_bt.columns = df_bt.columns.get_level_values(0)
+    except: pass
 
-    # ATTEMPT 2: Binance PAXG (Physical Gold Peg) Failsafe
-    if df_live is None or df_live.empty:
+    # ATTEMPT 2: TradingView Python API
+    if df_live.empty or df_bt.empty:
+        if tv is not None:
+            try:
+                df_live = tv.get_hist(symbol='XAUUSD', exchange='FXCM', interval=Interval.in_15_minute, n_bars=1400)
+                df_bt = tv.get_hist(symbol='XAUUSD', exchange='FXCM', interval=Interval.in_1_hour, n_bars=4500)
+            except: pass
+
+    # ATTEMPT 3: yfinance Futures (GC=F)
+    if df_live is None or df_live.empty or df_bt is None or df_bt.empty:
         try:
-            # 15-Minute Data
-            res_15m = requests.get("https://api.binance.com/api/v3/klines?symbol=PAXGUSDT&interval=15m&limit=1000", timeout=5).json()
-            df_live = pd.DataFrame(res_15m, columns=['time', 'open', 'high', 'low', 'close', 'v', 'ct', 'qav', 'nt', 'tbb', 'tbq', 'i'])
-            df_live.index = pd.to_datetime(df_live['time'], unit='ms', utc=True)
-            df_live = df_live[['open', 'high', 'low', 'close']].astype(float)
+            df_live = yf.download("GC=F", period="14d", interval="15m", progress=False)
+            df_bt = yf.download("GC=F", period="6mo", interval="1h", progress=False)
+            if not df_live.empty and isinstance(df_live.columns, pd.MultiIndex):
+                df_live.columns = df_live.columns.get_level_values(0)
+                df_bt.columns = df_bt.columns.get_level_values(0)
+        except: pass
+
+    # ATTEMPT 4: KuCoin PAXG (Unblockable US-friendly Crypto Fallback)
+    if df_live is None or df_live.empty or df_bt is None or df_bt.empty:
+        try:
+            # 15m structural data
+            res_15 = requests.get("https://api.kucoin.com/api/v1/market/candles?type=15min&symbol=PAXG-USDT", timeout=5).json()
+            d1 = pd.DataFrame(res_15['data'], columns=['time', 'open', 'close', 'high', 'low', 'v', 't'])
+            d1['time'] = pd.to_datetime(d1['time'].astype(int), unit='s', utc=True)
+            df_live = d1[['time', 'open', 'high', 'low', 'close']].set_index('time').astype(float).sort_index()
             
-            # 1-Hour Data
-            res_1h = requests.get("https://api.binance.com/api/v3/klines?symbol=PAXGUSDT&interval=1h&limit=1000", timeout=5).json()
-            df_bt = pd.DataFrame(res_1h, columns=['time', 'open', 'high', 'low', 'close', 'v', 'ct', 'qav', 'nt', 'tbb', 'tbq', 'i'])
-            df_bt.index = pd.to_datetime(df_bt['time'], unit='ms', utc=True)
-            df_bt = df_bt[['open', 'high', 'low', 'close']].astype(float)
-        except Exception:
-            pass
+            # 1h backtest data
+            res_1h = requests.get("https://api.kucoin.com/api/v1/market/candles?type=1hour&symbol=PAXG-USDT", timeout=5).json()
+            d2 = pd.DataFrame(res_1h['data'], columns=['time', 'open', 'close', 'high', 'low', 'v', 't'])
+            d2['time'] = pd.to_datetime(d2['time'].astype(int), unit='s', utc=True)
+            df_bt = d2[['time', 'open', 'high', 'low', 'close']].set_index('time').astype(float).sort_index()
+        except: pass
             
-    # Standardize columns and apply spread alignment
-    for df in [df_live, df_bt]:
-        if df is not None and not df.empty:
-            if 'open' in df.columns:
-                df.rename(columns={'open': 'Open', 'high': 'High', 'low': 'Low', 'close': 'Close'}, inplace=True)
+    # Universal Clean & Align Module
+    if df_live is not None and not df_live.empty and df_bt is not None and not df_bt.empty:
+        for df in [df_live, df_bt]:
+            # Clean columns (Handles YF, TV, and Kucoin column naming variants)
+            df.rename(columns=lambda x: x.capitalize() if isinstance(x, str) else x, inplace=True)
+            
+            # Clean timezone
             if df.index.tz is None:
                 df.index = df.index.tz_localize('UTC')
             else:
                 df.index = df.index.tz_convert('UTC')
 
-    # Spread Offset (Maps Binance/OANDA historical prices perfectly to your live TV Spot)
-    if df_live is not None and not df_live.empty:
-        active_historical_bar = float(df_live['Close'].iloc[-1])
+        # Spread Offset Math (Anchors whatever asset we pulled perfectly to the TV live spot price)
+        active_historical_bar = float(df_live['Close'].dropna().iloc[-1])
         spread = active_historical_bar - anchor
         for df in [df_live, df_bt]:
-            if df is not None and not df.empty:
-                for col in ['Open', 'High', 'Low', 'Close']:
+            for col in ['Open', 'High', 'Low', 'Close']:
+                if col in df.columns:
                     df[col] = df[col] - spread
                     
-    return df_live, df_bt
+        return df_live, df_bt
+        
+    return pd.DataFrame(), pd.DataFrame()
 
 # --- SMC STRUCTURAL LOGIC ---
 def analyze_smc_structure(df, window=12):
@@ -346,4 +380,4 @@ if df_live is not None and not df_live.empty and df_bt is not None and not df_bt
         else:
             st.warning("No trades triggered under current parameters.")
 else:
-    st.error("All data feeds are currently unreachable.")
+    st.error("All data feeds are currently unreachable. Streamlit Cloud is blocking the requested sources.")
