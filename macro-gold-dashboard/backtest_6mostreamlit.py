@@ -3,7 +3,6 @@ import yfinance as yf
 import pandas as pd
 import numpy as np
 from scipy.signal import argrelextrema
-import matplotlib.subplots as plt_sub
 import matplotlib.pyplot as plt
 import matplotlib.dates as mdates
 from tvDatafeed import TvDatafeed, Interval
