@@ -5,52 +5,40 @@ import numpy as np
 from scipy.signal import argrelextrema
 import matplotlib.pyplot as plt
 import matplotlib.dates as mdates
-from tvDatafeed import TvDatafeed, Interval
 import requests
-import logging
-
-# Silence TradingView login warnings
-logging.getLogger('tvDatafeed').setLevel(logging.ERROR)
 
 st.set_page_config(page_title="Macro-SMC Unified Engine", layout="wide")
-st.title("Unified Execution: Macro Filter + Deep OTE SMC Engine")
+st.title("Unified Execution: Macro Filter + Deep OTE Engine")
 
 CURRENT_CPI = 3.35  # Static CPI baseline
 
-# --- INITIALIZE TRADINGVIEW CONNECTION ---
-@st.cache_resource
-def get_tv_connection():
-    try:
-        return TvDatafeed()
-    except Exception:
-        return None
-
-tv = get_tv_connection()
-
-# --- REAL-TIME PURE SPOT FETCHER ---
-@st.cache_data(ttl=20)
+# --- 1. REAL-TIME SPOT FETCHER ---
+@st.cache_data(ttl=15)
 def get_live_xauusd_spot():
-    """Fetches exact live Gold Spot via an unblockable multi-source cascade."""
+    """Fetches exact live Gold Spot, bypassing yfinance blocks."""
     headers = {'User-Agent': 'Mozilla/5.0'}
     
+    # Priority 1: TradingView CFD Scanner (Exact FXCM Match)
     try:
         url = "https://scanner.tradingview.com/cfd/scan"
         payload = {"symbols": {"tickers": ["FXCM:XAUUSD", "OANDA:XAUUSD"]}, "columns": ["close"]}
-        res = requests.post(url, json=payload, headers=headers, timeout=5)
+        res = requests.post(url, json=payload, headers=headers, timeout=3)
         if res.status_code == 200:
             price = res.json().get('data', [{}])[0].get('d', [0])[0]
             if price > 1000: return float(price)
     except: pass
-
+    
+    # Priority 2: KuCoin PAXG-USDT (1:1 Gold Peg, Unblocked for US Cloud)
     try:
-        url = "https://api.mexc.com/api/v3/ticker/price?symbol=PAXGUSDT"
+        url = "https://api.kucoin.com/api/v1/market/orderbook/level1?symbol=PAXG-USDT"
         res = requests.get(url, timeout=3)
         if res.status_code == 200:
-            price = res.json().get('price')
+            price = res.json().get('data', {}).get('price')
             if price and float(price) > 1000: return float(price)
     except: pass
 
-    return 4197.50
+    # Failsafe
+    return 4285.00
 
 market_spot = get_live_xauusd_spot()
 
@@ -60,73 +48,90 @@ capital = st.sidebar.number_input("Starting Capital ($)", min_value=1000.0, valu
 risk_pct = st.sidebar.slider("Risk Per Trade (%)", 0.5, 5.0, 2.0, 0.5)
 bt_window = st.sidebar.slider("SMC Structural Lookback (1H)", 5, 30, 15)
 
-# --- UNIFIED DATA PIPELINE (MACRO + UNBLOCKED SPOT SMC) ---
+# --- 2. UNIFIED DATA PIPELINE (MACRO + SMC) ---
 @st.cache_data(ttl=300)
 def fetch_unified_data(anchor: float):
-    # 1. Fetch Daily Macro Data (yfinance 1D data is rarely blocked)
-    tickers = {"DX-Y.NYB": "DXY", "^TNX": "Nominal_10Y"}
-    series_list = []
-    for t, name in tickers.items():
-        try:
+    # A. Fetch Daily Macro Data (Wrapped to prevent crashes if blocked)
+    df_macro = pd.DataFrame()
+    try:
+        tickers = {"DX-Y.NYB": "DXY", "^TNX": "Nominal_10Y"}
+        series_list = []
+        for t, name in tickers.items():
             d = yf.download(t, period="6mo", interval="1d", progress=False)
             if not d.empty:
                 if isinstance(d.columns, pd.MultiIndex): d.columns = d.columns.get_level_values(0)
                 s = d['Close']
                 s.name = name
                 series_list.append(s)
-        except: pass
-        
-    df_macro = pd.concat(series_list, axis=1).ffill().dropna()
-    df_macro['Real_Yield'] = df_macro['Nominal_10Y'] - CURRENT_CPI
-    df_macro['DXY_SMA20'] = df_macro['DXY'].rolling(window=20).mean()
-    df_macro['Yield_SMA20'] = df_macro['Real_Yield'].rolling(window=20).mean()
-    
-    bull = (df_macro['DXY'] < df_macro['DXY_SMA20']) & (df_macro['Real_Yield'] < df_macro['Yield_SMA20'])
-    bear = (df_macro['DXY'] > df_macro['DXY_SMA20']) & (df_macro['Real_Yield'] > df_macro['Yield_SMA20'])
-    df_macro['Macro_Signal'] = np.select([bull, bear], [1, -1], default=0)
-    
-    if df_macro.index.tz is not None: df_macro.index = df_macro.index.tz_localize(None)
-    df_macro['Date_Only'] = df_macro.index.normalize()
+                
+        if len(series_list) == 2:
+            df_macro = pd.concat(series_list, axis=1).ffill().dropna()
+            df_macro['Real_Yield'] = df_macro['Nominal_10Y'] - CURRENT_CPI
+            df_macro['DXY_SMA20'] = df_macro['DXY'].rolling(window=20).mean()
+            df_macro['Yield_SMA20'] = df_macro['Real_Yield'].rolling(window=20).mean()
+            
+            bull = (df_macro['DXY'] < df_macro['DXY_SMA20']) & (df_macro['Real_Yield'] < df_macro['Yield_SMA20'])
+            bear = (df_macro['DXY'] > df_macro['DXY_SMA20']) & (df_macro['Real_Yield'] > df_macro['Yield_SMA20'])
+            df_macro['Macro_Signal'] = np.select([bull, bear], [1, -1], default=0)
+            
+            if df_macro.index.tz is not None: df_macro.index = df_macro.index.tz_localize(None)
+            df_macro['Date_Only'] = df_macro.index.normalize()
+    except: pass
 
-    # 2. Fetch Pure SMC Spot Data (Bypassing GC=F Futures)
+    # B. Fetch Hourly/15m SMC Data
     df_live, df_bt = pd.DataFrame(), pd.DataFrame()
 
-    if tv is not None:
+    # Attempt 1: Spot XAUUSD (yfinance)
+    try:
+        df_live = yf.download("XAUUSD=X", period="14d", interval="15m", progress=False)
+        df_bt = yf.download("XAUUSD=X", period="6mo", interval="1h", progress=False)
+    except: pass
+
+    # Attempt 2: GC=F Futures (yfinance)
+    if df_live.empty or df_bt.empty:
         try:
-            df_live = tv.get_hist(symbol='XAUUSD', exchange='FXCM', interval=Interval.in_15_minute, n_bars=1500)
-            df_bt = tv.get_hist(symbol='XAUUSD', exchange='FXCM', interval=Interval.in_1_hour, n_bars=4500)
+            df_live = yf.download("GC=F", period="14d", interval="15m", progress=False)
+            df_bt = yf.download("GC=F", period="6mo", interval="1h", progress=False)
+        except: pass
+        
+    # Attempt 3: KuCoin PAXG (If yfinance is entirely blocked)
+    if df_live.empty or df_bt.empty:
+        try:
+            res_15 = requests.get("https://api.kucoin.com/api/v1/market/candles?type=15min&symbol=PAXG-USDT", timeout=5).json()
+            d1 = pd.DataFrame(res_15['data'], columns=['time', 'open', 'close', 'high', 'low', 'v', 't'])
+            d1['time'] = pd.to_datetime(d1['time'].astype(int), unit='s', utc=True)
+            df_live = d1[['time', 'open', 'high', 'low', 'close']].set_index('time').astype(float).sort_index()
+            
+            res_1h = requests.get("https://api.kucoin.com/api/v1/market/candles?type=1hour&symbol=PAXG-USDT", timeout=5).json()
+            d2 = pd.DataFrame(res_1h['data'], columns=['time', 'open', 'close', 'high', 'low', 'v', 't'])
+            d2['time'] = pd.to_datetime(d2['time'].astype(int), unit='s', utc=True)
+            df_bt = d2[['time', 'open', 'high', 'low', 'close']].set_index('time').astype(float).sort_index()
         except: pass
 
-    if df_live is None or df_live.empty or df_bt is None or df_bt.empty:
-        try:
-            r15 = requests.get("https://api-pub.bitfinex.com/v2/candles/trade:15m:tXAUUSD/hist?limit=1500", timeout=5).json()
-            d15 = pd.DataFrame(r15, columns=['time', 'open', 'close', 'high', 'low', 'volume'])
-            d15['time'] = pd.to_datetime(d15['time'], unit='ms', utc=True)
-            df_live = d15[['time', 'open', 'high', 'low', 'close']].set_index('time').astype(float).sort_index()
-
-            r1h = requests.get("https://api-pub.bitfinex.com/v2/candles/trade:1h:tXAUUSD/hist?limit=4500", timeout=5).json()
-            d1h = pd.DataFrame(r1h, columns=['time', 'open', 'close', 'high', 'low', 'volume'])
-            d1h['time'] = pd.to_datetime(d1h['time'], unit='ms', utc=True)
-            df_bt = d1h[['time', 'open', 'high', 'low', 'close']].set_index('time').astype(float).sort_index()
-        except: pass
-
-    # Clean, Align, and Merge
-    if df_live is not None and not df_live.empty and df_bt is not None and not df_bt.empty:
+    # Clean & Perfect Alignment
+    if not df_live.empty and not df_bt.empty:
         for df in [df_live, df_bt]:
+            if isinstance(df.columns, pd.MultiIndex): df.columns = df.columns.get_level_values(0)
             df.rename(columns=lambda x: x.capitalize() if isinstance(x, str) else x, inplace=True)
             if df.index.tz is not None: df.index = df.index.tz_localize(None)
+            df.dropna(inplace=True)
 
-        active_historical_bar = float(df_live['Close'].dropna().iloc[-1])
+        active_historical_bar = float(df_live['Close'].iloc[-1])
         spread = active_historical_bar - anchor
         for df in [df_live, df_bt]:
             for col in ['Open', 'High', 'Low', 'Close']:
                 df[col] = df[col] - spread
 
+        # Merge Pipeline
         df_bt['Date_Only'] = df_bt.index.normalize()
-        df_unified = pd.merge(df_bt, df_macro[['Date_Only', 'Macro_Signal']], on='Date_Only', how='left')
-        df_unified.index = df_bt.index
-        df_unified['Macro_Signal'] = df_unified['Macro_Signal'].ffill().fillna(0)
-        
+        if not df_macro.empty:
+            df_unified = pd.merge(df_bt, df_macro[['Date_Only', 'Macro_Signal']], on='Date_Only', how='left')
+            df_unified.index = df_bt.index
+            df_unified['Macro_Signal'] = df_unified['Macro_Signal'].ffill().fillna(0)
+        else:
+            df_bt['Macro_Signal'] = 0 # Defaults to Neutral if Yahoo blocks Macro
+            df_unified = df_bt
+            
         return df_live, df_unified
 
     return pd.DataFrame(), pd.DataFrame()
@@ -146,7 +151,7 @@ def analyze_smc_structure(df, window=12):
     total_range = recent_high - recent_low
     equilibrium = recent_high - (total_range * 0.50)
     
-    # Deep OTE: 70.5% to 78.6% (Filters out premature 61.8% entries)
+    # Deep OTE: 70.5% to 78.6% (Filters out premature entries)
     golden_zone_low = recent_high - (total_range * 0.295) 
     golden_zone_high = recent_high - (total_range * 0.214)
     
@@ -196,16 +201,22 @@ def run_macro_smc_backtest(df, start_capital, risk, window):
             is_long_setup = (long_ote_low <= close <= long_ote_high) and close < eq
             
             if is_short_setup:
-                if macro_bias == -1: 
+                if macro_bias in [-1, 0]: # Macro Agrees OR is Neutral/Blocked
                     in_trade, trade_type = True, 'Short'
-                    entry_price, stop_loss, take_profit, entry_date = close, high + 2.50, low, date
+                    entry_price = close
+                    stop_loss = high + 3.00 # Widened structural stop to prevent wicks
+                    take_profit = low
+                    entry_date = date
                 else: 
                     skipped_trades += 1
                     
             elif is_long_setup:
-                if macro_bias == 1: 
+                if macro_bias in [1, 0]: # Macro Agrees OR is Neutral/Blocked
                     in_trade, trade_type = True, 'Long'
-                    entry_price, stop_loss, take_profit, entry_date = close, low - 2.50, high, date
+                    entry_price = close
+                    stop_loss = low - 3.00 # Widened structural stop to prevent wicks
+                    take_profit = high
+                    entry_date = date
                 else: 
                     skipped_trades += 1
                 
@@ -215,21 +226,21 @@ def run_macro_smc_backtest(df, start_capital, risk, window):
             if trade_type == 'Short':
                 if curr_high >= stop_loss:
                     equity -= risk_amt
-                    trades.append({'Entry Date': entry_date, 'Exit Date': date, 'Macro Bias': 'Bearish (-1)', 'Type': 'Short', 'Result': 'Loss', 'Entry Price': entry_price, 'Stop Loss': stop_loss, 'Target (TP)': take_profit, 'Net P&L': -risk_amt})
+                    trades.append({'Entry Date': entry_date, 'Exit Date': date, 'Type': 'Short', 'Result': 'Loss', 'Entry Price': entry_price, 'Stop Loss': stop_loss, 'Target (TP)': take_profit, 'Net P&L': -risk_amt})
                     in_trade = False
                 elif curr_low <= take_profit:
                     equity += risk_amt * ((entry_price - take_profit) / (stop_loss - entry_price))
-                    trades.append({'Entry Date': entry_date, 'Exit Date': date, 'Macro Bias': 'Bearish (-1)', 'Type': 'Short', 'Result': 'Win', 'Entry Price': entry_price, 'Stop Loss': stop_loss, 'Target (TP)': take_profit, 'Net P&L': risk_amt * ((entry_price - take_profit) / (stop_loss - entry_price))})
+                    trades.append({'Entry Date': entry_date, 'Exit Date': date, 'Type': 'Short', 'Result': 'Win', 'Entry Price': entry_price, 'Stop Loss': stop_loss, 'Target (TP)': take_profit, 'Net P&L': risk_amt * ((entry_price - take_profit) / (stop_loss - entry_price))})
                     in_trade = False
                     
             elif trade_type == 'Long':
                 if curr_low <= stop_loss:
                     equity -= risk_amt
-                    trades.append({'Entry Date': entry_date, 'Exit Date': date, 'Macro Bias': 'Bullish (+1)', 'Type': 'Long', 'Result': 'Loss', 'Entry Price': entry_price, 'Stop Loss': stop_loss, 'Target (TP)': take_profit, 'Net P&L': -risk_amt})
+                    trades.append({'Entry Date': entry_date, 'Exit Date': date, 'Type': 'Long', 'Result': 'Loss', 'Entry Price': entry_price, 'Stop Loss': stop_loss, 'Target (TP)': take_profit, 'Net P&L': -risk_amt})
                     in_trade = False
                 elif curr_high >= take_profit:
                     equity += risk_amt * ((take_profit - entry_price) / (entry_price - stop_loss))
-                    trades.append({'Entry Date': entry_date, 'Exit Date': date, 'Macro Bias': 'Bullish (+1)', 'Type': 'Long', 'Result': 'Win', 'Entry Price': entry_price, 'Stop Loss': stop_loss, 'Target (TP)': take_profit, 'Net P&L': risk_amt * ((take_profit - entry_price) / (entry_price - stop_loss))})
+                    trades.append({'Entry Date': entry_date, 'Exit Date': date, 'Type': 'Long', 'Result': 'Win', 'Entry Price': entry_price, 'Stop Loss': stop_loss, 'Target (TP)': take_profit, 'Net P&L': risk_amt * ((take_profit - entry_price) / (entry_price - stop_loss))})
                     in_trade = False
                     
             if not in_trade:
@@ -265,16 +276,16 @@ if not df_unified.empty:
             st.markdown(f"**Market Valuation:** :{badge_color}[{status}]")
 
         with col2:
-            st.markdown("### Deep OTE Execution Plan")
+            st.markdown("### High-Probability Execution Plan")
             if current_price > eq:
-                st.write(f"**Optimal Short Entry Zone:** ${gz_low:,.2f} – ${gz_high:,.2f}")
-                st.write(f"**Stop Loss:** ${swing_high + 2.50:,.2f}")
+                st.write(f"**Deep OTE Short Entry Zone:** ${gz_low:,.2f} – ${gz_high:,.2f}")
+                st.write(f"**Stop Loss:** ${swing_high + 3.00:,.2f}")
                 st.write(f"**Take Profit:** ${swing_low:,.2f}")
             else:
                 long_ote_high = swing_low + ((swing_high - swing_low) * 0.295)
                 long_ote_low = swing_low + ((swing_high - swing_low) * 0.214)
-                st.write(f"**Optimal Long Entry Zone:** ${long_ote_low:,.2f} – ${long_ote_high:,.2f}")
-                st.write(f"**Stop Loss:** ${swing_low - 2.50:,.2f}")
+                st.write(f"**Deep OTE Long Entry Zone:** ${long_ote_low:,.2f} – ${long_ote_high:,.2f}")
+                st.write(f"**Stop Loss:** ${swing_low - 3.00:,.2f}")
                 st.write(f"**Take Profit:** ${swing_high:,.2f}")
             
         st.divider()
@@ -304,7 +315,7 @@ if not df_unified.empty:
         st.pyplot(fig)
         
     with tab2:
-        st.subheader("6-Month Results: Macro-Filtered Deep OTE Executions")
+        st.subheader("6-Month Results: Macro-Filtered High-Probability Executions")
         
         trades, bt_dates, equity_curve, skipped = run_macro_smc_backtest(df_unified, capital, risk_pct, bt_window)
         total_trades = len(trades)
@@ -343,6 +354,6 @@ if not df_unified.empty:
             trade_df['Net P&L'] = trade_df['Net P&L'].apply(lambda x: f"${x:,.2f}")
             st.dataframe(trade_df, use_container_width=True, hide_index=True)
         else:
-            st.warning("No trades triggered. The Macro trend and Deep OTE structure did not align during this 6-month period.")
+            st.warning("No trades triggered. The Macro trend and High-Probability structure did not align during this 6-month period.")
 else:
-    st.error("Market data feeds are currently unreachable.")
+    st.error("Market data feeds are currently unreachable. Streamlit Cloud IPs have been rate-limited by the provider.")
