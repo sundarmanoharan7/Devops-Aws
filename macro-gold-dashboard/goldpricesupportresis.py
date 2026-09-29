@@ -3,7 +3,6 @@ import yfinance as yf
 import pandas as pd
 import numpy as np
 from scipy.signal import argrelextrema
-import matplotlib.subplots as plt_sub
 import matplotlib.pyplot as plt
 import matplotlib.dates as mdates
 from tvDatafeed import TvDatafeed, Interval
@@ -33,7 +32,6 @@ def get_live_xauusd_spot():
     """Fetches exact live Gold Spot via an unblockable multi-source cascade."""
     headers = {'User-Agent': 'Mozilla/5.0'}
     
-    # Priority 1: TradingView CFD Scanner (Exact FXCM Match)
     try:
         url = "https://scanner.tradingview.com/cfd/scan"
         payload = {"symbols": {"tickers": ["FXCM:XAUUSD", "OANDA:XAUUSD"]}, "columns": ["close"]}
@@ -43,7 +41,6 @@ def get_live_xauusd_spot():
             if price > 1000: return float(price)
     except: pass
     
-    # Priority 2: KuCoin PAXG-USDT (1:1 Gold Peg, Unblocked for US Cloud)
     try:
         url = "https://api.kucoin.com/api/v1/market/orderbook/level1?symbol=PAXG-USDT"
         res = requests.get(url, timeout=3)
@@ -52,7 +49,6 @@ def get_live_xauusd_spot():
             if price and float(price) > 1000: return float(price)
     except: pass
 
-    # Priority 3: MEXC PAXGUSDT
     try:
         url = "https://api.mexc.com/api/v3/ticker/price?symbol=PAXGUSDT"
         res = requests.get(url, timeout=3)
@@ -82,7 +78,6 @@ def fetch_market_data():
     """Fetches pure, unshifted structural market data."""
     df_1h, df_1d = pd.DataFrame(), pd.DataFrame()
     
-    # ATTEMPT 1: TradingView API (Iterating through unblocked exchanges)
     if tv is not None:
         exchanges = ['OANDA', 'FXCM', 'FOREXCOM']
         for exc in exchanges:
@@ -92,7 +87,6 @@ def fetch_market_data():
                 if df_1h is not None and not df_1h.empty: break
             except: continue
 
-    # ATTEMPT 2: MEXC PAXGUSDT (100% US Cloud Friendly)
     if df_1h is None or df_1h.empty or df_1d is None or df_1d.empty:
         try:
             r1h = requests.get("https://api.mexc.com/api/v3/klines?symbol=PAXGUSDT&interval=60m&limit=1000", timeout=5).json()
@@ -106,7 +100,6 @@ def fetch_market_data():
             df_1d = d1d[['time', 'open', 'high', 'low', 'close']].set_index('time').astype(float).sort_index()
         except: pass
 
-    # ATTEMPT 3: KuCoin PAXG-USDT
     if df_1h is None or df_1h.empty or df_1d is None or df_1d.empty:
         try:
             r1h = requests.get("https://api.kucoin.com/api/v1/market/candles?type=1hour&symbol=PAXG-USDT", timeout=5).json()
@@ -120,14 +113,12 @@ def fetch_market_data():
             df_1d = d1d[['time', 'open', 'high', 'low', 'close']].set_index('time').astype(float).sort_index()
         except: pass
 
-    # ATTEMPT 4: yfinance
     if df_1h is None or df_1h.empty or df_1d is None or df_1d.empty:
         try:
             df_1h = yf.download("XAUUSD=X", period="60d", interval="1h", progress=False)
             df_1d = yf.download("XAUUSD=X", period="1y", interval="1d", progress=False)
         except: pass
 
-    # Clean the Data (Offset Math Removed Entirely)
     if df_1h is not None and not df_1h.empty and df_1d is not None and not df_1d.empty:
         for df in [df_1h, df_1d]:
             if isinstance(df.columns, pd.MultiIndex): df.columns = df.columns.get_level_values(0)
@@ -137,7 +128,6 @@ def fetch_market_data():
             else:
                 df.index = df.index.tz_convert('UTC')
                 
-        # Resample the 1H candles into clean 4H candles
         df_4h = df_1h.resample('4h').agg({
             'Open': 'first',
             'High': 'max',
@@ -149,11 +139,9 @@ def fetch_market_data():
         
     return pd.DataFrame(), pd.DataFrame(), pd.DataFrame()
 
-# --- LEVEL DETECTION (LOCKED TO CLOSED CANDLES) ---
+# --- MULTI-LEVEL DETECTION (LOCKED TO CLOSED CANDLES) ---
 def find_structural_levels(df, window=5):
-    # CRITICAL FIX: Slicing out the active unclosed candle prevents repainting
     closed_df = df.iloc[:-1]
-    
     maxima_indices = argrelextrema(closed_df['High'].values, np.greater, order=window)[0]
     resistances = closed_df['High'].iloc[maxima_indices].values
     
@@ -166,12 +154,15 @@ def extract_key_levels(supports_all, resistances_all, live_price):
     res_above = sorted([r for r in set(resistances_all) if r > live_price])
     sup_below = sorted([s for s in set(supports_all) if s < live_price], reverse=True)
     
-    res_1 = res_above[0] if len(res_above) > 0 else None
-    sup_minor = sup_below[0] if len(sup_below) > 0 else None
-    sup_maj1 = sup_below[1] if len(sup_below) > 1 else None
-    sup_maj2 = sup_below[2] if len(sup_below) > 2 else None
+    r1 = res_above[0] if len(res_above) > 0 else None
+    r2 = res_above[1] if len(res_above) > 1 else None
+    r3 = res_above[2] if len(res_above) > 2 else None
     
-    return res_1, sup_minor, sup_maj1, sup_maj2
+    s1 = sup_below[0] if len(sup_below) > 0 else None
+    s2 = sup_below[1] if len(sup_below) > 1 else None
+    s3 = sup_below[2] if len(sup_below) > 2 else None
+    
+    return r1, r2, r3, s1, s2, s3
 
 def shade_london_ny_overlap(ax, df_subset):
     unique_dates = sorted(list(set(df_subset.index.date)))
@@ -192,15 +183,15 @@ if not df_1h.empty and not df_1d.empty:
     
     # 1. Daily Levels
     sup_1d, res_1d = find_structural_levels(df_1d, window=7)
-    r1_1d, s_min_1d, s_maj1_1d, s_maj2_1d = extract_key_levels(sup_1d, res_1d, current_price)
+    r1_1d, r2_1d, r3_1d, s1_1d, s2_1d, s3_1d = extract_key_levels(sup_1d, res_1d, current_price)
 
     # 2. 4-Hour Levels
     sup_4h, res_4h = find_structural_levels(df_4h, window=5)
-    r1_4h, s_min_4h, s_maj1_4h, s_maj2_4h = extract_key_levels(sup_4h, res_4h, current_price)
+    r1_4h, r2_4h, r3_4h, s1_4h, s2_4h, s3_4h = extract_key_levels(sup_4h, res_4h, current_price)
     
     # 3. 1-Hour Levels
     sup_1h, res_1h = find_structural_levels(df_1h, window=8)
-    r1_1h, s_min_1h, s_maj1_1h, s_maj2_1h = extract_key_levels(sup_1h, res_1h, current_price)
+    r1_1h, r2_1h, r3_1h, s1_1h, s2_1h, s3_1h = extract_key_levels(sup_1h, res_1h, current_price)
 
     # Metrics Display
     st.subheader(f"Current Live Spot Price: ${current_price:,.2f}")
@@ -208,24 +199,33 @@ if not df_1h.empty and not df_1d.empty:
     col_1d, col_4h, col_1h = st.columns(3)
     with col_1d:
         st.markdown("### Daily (D1) Macro")
-        st.write(f"**1st Resistance:** ${r1_1d:,.2f}" if r1_1d else "**1st Resistance:** N/A")
-        st.write(f"**Minor Support:** ${s_min_1d:,.2f}" if s_min_1d else "**Minor Support:** N/A")
-        st.write(f"**Major Support 1:** ${s_maj1_1d:,.2f}" if s_maj1_1d else "**Major Support 1:** N/A")
-        st.write(f"**Major Support 2:** ${s_maj2_1d:,.2f}" if s_maj2_1d else "**Major Support 2:** N/A")
+        st.write(f"**Resistance 3:** ${r3_1d:,.2f}" if r3_1d else "**Resistance 3:** N/A")
+        st.write(f"**Resistance 2:** ${r2_1d:,.2f}" if r2_1d else "**Resistance 2:** N/A")
+        st.write(f"**Resistance 1:** ${r1_1d:,.2f}" if r1_1d else "**Resistance 1:** N/A")
+        st.write("---")
+        st.write(f"**Support 1 (Minor):** ${s1_1d:,.2f}" if s1_1d else "**Support 1:** N/A")
+        st.write(f"**Support 2 (Major):** ${s2_1d:,.2f}" if s2_1d else "**Support 2:** N/A")
+        st.write(f"**Support 3 (Macro):** ${s3_1d:,.2f}" if s3_1d else "**Support 3:** N/A")
 
     with col_4h:
         st.markdown("### 4-Hour (4H) Swing")
-        st.write(f"**1st Resistance:** ${r1_4h:,.2f}" if r1_4h else "**1st Resistance:** N/A")
-        st.write(f"**Minor Support:** ${s_min_4h:,.2f}" if s_min_4h else "**Minor Support:** N/A")
-        st.write(f"**Major Support 1:** ${s_maj1_4h:,.2f}" if s_maj1_4h else "**Major Support 1:** N/A")
-        st.write(f"**Major Support 2:** ${s_maj2_4h:,.2f}" if s_maj2_4h else "**Major Support 2:** N/A")
+        st.write(f"**Resistance 3:** ${r3_4h:,.2f}" if r3_4h else "**Resistance 3:** N/A")
+        st.write(f"**Resistance 2:** ${r2_4h:,.2f}" if r2_4h else "**Resistance 2:** N/A")
+        st.write(f"**Resistance 1:** ${r1_4h:,.2f}" if r1_4h else "**Resistance 1:** N/A")
+        st.write("---")
+        st.write(f"**Support 1 (Minor):** ${s1_4h:,.2f}" if s1_4h else "**Support 1:** N/A")
+        st.write(f"**Support 2 (Major):** ${s2_4h:,.2f}" if s2_4h else "**Support 2:** N/A")
+        st.write(f"**Support 3 (Macro):** ${s3_4h:,.2f}" if s3_4h else "**Support 3:** N/A")
 
     with col_1h:
         st.markdown("### 1-Hour (1H) Intraday")
-        st.write(f"**1st Resistance:** ${r1_1h:,.2f}" if r1_1h else "**1st Resistance:** N/A")
-        st.write(f"**Minor Support:** ${s_min_1h:,.2f}" if s_min_1h else "**Minor Support:** N/A")
-        st.write(f"**Major Support 1:** ${s_maj1_1h:,.2f}" if s_maj1_1h else "**Major Support 1:** N/A")
-        st.write(f"**Major Support 2:** ${s_maj2_1h:,.2f}" if s_maj2_1h else "**Major Support 2:** N/A")
+        st.write(f"**Resistance 3:** ${r3_1h:,.2f}" if r3_1h else "**Resistance 3:** N/A")
+        st.write(f"**Resistance 2:** ${r2_1h:,.2f}" if r2_1h else "**Resistance 2:** N/A")
+        st.write(f"**Resistance 1:** ${r1_1h:,.2f}" if r1_1h else "**Resistance 1:** N/A")
+        st.write("---")
+        st.write(f"**Support 1 (Minor):** ${s1_1h:,.2f}" if s1_1h else "**Support 1:** N/A")
+        st.write(f"**Support 2 (Major):** ${s2_1h:,.2f}" if s2_1h else "**Support 2:** N/A")
+        st.write(f"**Support 3 (Macro):** ${s3_1h:,.2f}" if s3_1h else "**Support 3:** N/A")
 
     st.divider()
 
@@ -236,10 +236,15 @@ if not df_1h.empty and not df_1d.empty:
         st.subheader("Daily Institutional Structure")
         fig_1d, ax_1d = plt.subplots(figsize=(14, 6))
         ax_1d.plot(df_1d.index, df_1d['Close'], label='D1 Close', color='black', linewidth=1.5)
-        if r1_1d: ax_1d.axhline(r1_1d, color='red', linestyle='--', alpha=0.85, label=f'D1 Supply (${r1_1d:,.2f})')
-        if s_min_1d: ax_1d.axhline(s_min_1d, color='lightgreen', linestyle='--', alpha=0.9, label=f'D1 Minor Demand (${s_min_1d:,.2f})')
-        if s_maj1_1d: ax_1d.axhline(s_maj1_1d, color='green', linestyle='-', alpha=0.75, label=f'D1 Demand 1 (${s_maj1_1d:,.2f})')
-        if s_maj2_1d: ax_1d.axhline(s_maj2_1d, color='darkgreen', linestyle='-', alpha=0.9, label=f'D1 Demand 2 (${s_maj2_1d:,.2f})')
+        
+        if r3_1d: ax_1d.axhline(r3_1d, color='darkred', linestyle='-', alpha=0.9, label=f'D1 R3 (${r3_1d:,.2f})')
+        if r2_1d: ax_1d.axhline(r2_1d, color='red', linestyle='-', alpha=0.75, label=f'D1 R2 (${r2_1d:,.2f})')
+        if r1_1d: ax_1d.axhline(r1_1d, color='lightcoral', linestyle='--', alpha=0.85, label=f'D1 R1 (${r1_1d:,.2f})')
+        
+        if s1_1d: ax_1d.axhline(s1_1d, color='lightgreen', linestyle='--', alpha=0.9, label=f'D1 S1 (${s1_1d:,.2f})')
+        if s2_1d: ax_1d.axhline(s2_1d, color='green', linestyle='-', alpha=0.75, label=f'D1 S2 (${s2_1d:,.2f})')
+        if s3_1d: ax_1d.axhline(s3_1d, color='darkgreen', linestyle='-', alpha=0.9, label=f'D1 S3 (${s3_1d:,.2f})')
+        
         ax_1d.set_ylabel('Spot Price (USD)')
         ax_1d.legend(loc='upper left', bbox_to_anchor=(1, 1))
         ax_1d.grid(alpha=0.2)
@@ -249,10 +254,15 @@ if not df_1h.empty and not df_1d.empty:
         st.subheader("4-Hour Structural Chart")
         fig_4h, ax_4h = plt.subplots(figsize=(14, 6))
         ax_4h.plot(df_4h.index, df_4h['Close'], label='H4 Close', color='black', linewidth=1.5)
-        if r1_4h: ax_4h.axhline(r1_4h, color='red', linestyle='--', alpha=0.85, label=f'H4 Supply (${r1_4h:,.2f})')
-        if s_min_4h: ax_4h.axhline(s_min_4h, color='lightgreen', linestyle='--', alpha=0.9, label=f'H4 Minor Demand (${s_min_4h:,.2f})')
-        if s_maj1_4h: ax_4h.axhline(s_maj1_4h, color='green', linestyle='-', alpha=0.75, label=f'H4 Demand 1 (${s_maj1_4h:,.2f})')
-        if s_maj2_4h: ax_4h.axhline(s_maj2_4h, color='darkgreen', linestyle='-', alpha=0.9, label=f'H4 Demand 2 (${s_maj2_4h:,.2f})')
+        
+        if r3_4h: ax_4h.axhline(r3_4h, color='darkred', linestyle='-', alpha=0.9, label=f'H4 R3 (${r3_4h:,.2f})')
+        if r2_4h: ax_4h.axhline(r2_4h, color='red', linestyle='-', alpha=0.75, label=f'H4 R2 (${r2_4h:,.2f})')
+        if r1_4h: ax_4h.axhline(r1_4h, color='lightcoral', linestyle='--', alpha=0.85, label=f'H4 R1 (${r1_4h:,.2f})')
+        
+        if s1_4h: ax_4h.axhline(s1_4h, color='lightgreen', linestyle='--', alpha=0.9, label=f'H4 S1 (${s1_4h:,.2f})')
+        if s2_4h: ax_4h.axhline(s2_4h, color='green', linestyle='-', alpha=0.75, label=f'H4 S2 (${s2_4h:,.2f})')
+        if s3_4h: ax_4h.axhline(s3_4h, color='darkgreen', linestyle='-', alpha=0.9, label=f'H4 S3 (${s3_4h:,.2f})')
+        
         ax_4h.set_ylabel('Spot Price (USD)')
         ax_4h.legend(loc='upper left', bbox_to_anchor=(1, 1))
         ax_4h.grid(alpha=0.2)
@@ -266,10 +276,14 @@ if not df_1h.empty and not df_1d.empty:
         fig_1h, ax_1h = plt.subplots(figsize=(14, 6))
         shade_london_ny_overlap(ax_1h, df_1h_view)
         ax_1h.plot(df_1h_view.index, df_1h_view['Close'], label='H1 Close', color='navy', linewidth=1.4)
-        if r1_1h: ax_1h.axhline(r1_1h, color='red', linestyle='--', alpha=0.85, label=f'H1 Supply (${r1_1h:,.2f})')
-        if s_min_1h: ax_1h.axhline(s_min_1h, color='lightgreen', linestyle='--', alpha=0.9, label=f'H1 Minor Demand (${s_min_1h:,.2f})')
-        if s_maj1_1h: ax_1h.axhline(s_maj1_1h, color='green', linestyle='-', alpha=0.75, label=f'H1 Demand 1 (${s_maj1_1h:,.2f})')
-        if s_maj2_1h: ax_1h.axhline(s_maj2_1h, color='darkgreen', linestyle='-', alpha=0.9, label=f'H1 Demand 2 (${s_maj2_1h:,.2f})')
+        
+        if r3_1h: ax_1h.axhline(r3_1h, color='darkred', linestyle='-', alpha=0.9, label=f'H1 R3 (${r3_1h:,.2f})')
+        if r2_1h: ax_1h.axhline(r2_1h, color='red', linestyle='-', alpha=0.75, label=f'H1 R2 (${r2_1h:,.2f})')
+        if r1_1h: ax_1h.axhline(r1_1h, color='lightcoral', linestyle='--', alpha=0.85, label=f'H1 R1 (${r1_1h:,.2f})')
+        
+        if s1_1h: ax_1h.axhline(s1_1h, color='lightgreen', linestyle='--', alpha=0.9, label=f'H1 S1 (${s1_1h:,.2f})')
+        if s2_1h: ax_1h.axhline(s2_1h, color='green', linestyle='-', alpha=0.75, label=f'H1 S2 (${s2_1h:,.2f})')
+        if s3_1h: ax_1h.axhline(s3_1h, color='darkgreen', linestyle='-', alpha=0.9, label=f'H1 S3 (${s3_1h:,.2f})')
         
         ax_1h.xaxis.set_major_locator(mdates.DayLocator(interval=2))
         ax_1h.xaxis.set_major_formatter(mdates.DateFormatter('%b %d'))
