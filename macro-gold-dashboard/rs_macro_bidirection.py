@@ -9,11 +9,10 @@ from tvDatafeed import TvDatafeed, Interval
 import requests
 import logging
 
-# Silence TradingView login warnings
 logging.getLogger('tvDatafeed').setLevel(logging.ERROR)
 
-st.set_page_config(page_title="Macro-SMC Alpha Engine", layout="wide")
-st.title("Macro-SMC Alpha Engine & Execution Desk")
+st.set_page_config(page_title="Macro-SMC Grid Engine", layout="wide")
+st.title("High-Yield SMC Grid Engine & Execution Desk")
 
 CURRENT_CPI = 3.35  
 
@@ -39,14 +38,6 @@ def get_live_xauusd_spot():
             if price and float(price) > 1000: return float(price)
     except: pass
 
-    try:
-        url = "https://api.mexc.com/api/v3/ticker/price?symbol=PAXGUSDT"
-        res = requests.get(url, timeout=3)
-        if res.status_code == 200:
-            price = res.json().get('price')
-            if price and float(price) > 1000: return float(price)
-    except: pass
-
     return 4197.50
 
 live_price = get_live_xauusd_spot()
@@ -57,11 +48,11 @@ def get_tv_connection():
     except: return None
 
 # --- SIDEBAR CONTROLS ---
-st.sidebar.header("Execution Parameters")
+st.sidebar.header("Grid Execution Parameters")
 st.sidebar.success(f"Live Feed Synchronized\n\n**Spot: ${live_price:,.2f}**")
 
 capital = st.sidebar.number_input("Account Balance ($)", min_value=1000.0, value=15000.0, step=1000.0)
-risk_pct = st.sidebar.slider("Risk Per Trade (%)", 0.5, 5.0, 2.0, 0.5)
+risk_pct = st.sidebar.slider("Base Risk Per Grid (%)", 1.0, 10.0, 3.0, 0.5, help="Aggressive compounding requires 3-5% base risk.")
 bt_window = st.sidebar.slider("Structural Swing Lookback", 5, 30, 15)
 
 # --- 2. UNIFIED DATA PIPELINE ---
@@ -88,9 +79,7 @@ def fetch_unified_data():
             bull = (df_macro['DXY'] < df_macro['DXY_SMA20']) & (df_macro['Real_Yield'] < df_macro['Yield_SMA20'])
             bear = (df_macro['DXY'] > df_macro['DXY_SMA20']) & (df_macro['Real_Yield'] > df_macro['Yield_SMA20'])
             df_macro['Macro_Signal'] = np.select([bull, bear], [1, -1], default=0)
-            
-            if df_macro.index.tz is not None: df_macro.index = df_macro.index.tz_localize(None)
-            df_macro['Date_Only'] = df_macro.index.normalize()
+            df_macro['Date_Only'] = df_macro.index.tz_localize(None).normalize()
     except: pass
 
     df_1h, df_1d = pd.DataFrame(), pd.DataFrame()
@@ -102,7 +91,7 @@ def fetch_unified_data():
             try:
                 df_1h = tv.get_hist(symbol='XAUUSD', exchange=exc, interval=Interval.in_1_hour, n_bars=1500)
                 df_1d = tv.get_hist(symbol='XAUUSD', exchange=exc, interval=Interval.in_daily, n_bars=300)
-                if df_1h is not None and not df_1h.empty and df_1d is not None and not df_1d.empty: break
+                if df_1h is not None and not df_1h.empty: break
             except: continue
 
     if df_1h is None or df_1h.empty:
@@ -124,7 +113,7 @@ def fetch_unified_data():
             df_1d = yf.download("XAUUSD=X", period="1y", interval="1d", progress=False)
         except: pass
 
-    if df_1h is not None and not df_1h.empty and df_1d is not None and not df_1d.empty:
+    if df_1h is not None and not df_1h.empty:
         for df in [df_1h, df_1d]:
             if isinstance(df.columns, pd.MultiIndex): df.columns = df.columns.get_level_values(0)
             df.rename(columns=lambda x: x.capitalize() if isinstance(x, str) else x, inplace=True)
@@ -142,9 +131,9 @@ def fetch_unified_data():
             df_1h['Macro_Signal'] = 0
             df_unified = df_1h
 
-        return df_unified, df_4h, df_1d, df_macro
+        return df_unified, df_4h, df_1d
 
-    return pd.DataFrame(), pd.DataFrame(), pd.DataFrame(), pd.DataFrame()
+    return pd.DataFrame(), pd.DataFrame(), pd.DataFrame()
 
 # --- 3. S/R LEVEL EXTRACTION ---
 def find_structural_levels(df, window=5):
@@ -162,33 +151,25 @@ def extract_key_levels(supports_all, resistances_all, current_price):
     
     r1 = res_above[0] if len(res_above) > 0 else None
     r2 = res_above[1] if len(res_above) > 1 else None
-    r3 = res_above[2] if len(res_above) > 2 else None
     s1 = sup_below[0] if len(sup_below) > 0 else None
     s2 = sup_below[1] if len(sup_below) > 1 else None
-    s3 = sup_below[2] if len(sup_below) > 2 else None
-    
-    return r1, r2, r3, s1, s2, s3
+    return r1, r2, s1, s2
 
-# --- 4. HIGH-PROBABILITY BACKTEST ENGINE (>70% TARGET) ---
-def run_macro_smc_backtest(df, start_capital, risk, window, current_live_price):
+# --- 4. AVERAGING-DOWN GRID BACKTEST ENGINE ---
+def run_grid_backtest(df, start_capital, risk_pct, window):
     df = df.copy()
     df['Swing_High'] = df['High'].rolling(window=window*2, center=False).max().ffill()
     df['Swing_Low'] = df['Low'].rolling(window=window*2, center=False).min().ffill()
     
     in_trade = False
     trade_type = None
-    entry_price, stop_loss, take_profit = 0.0, 0.0, 0.0
+    blended_entry, stop_loss, take_profit = 0.0, 0.0, 0.0
     entry_date = None
     
     equity = start_capital
     equity_curve = [start_capital]
     dates = [df.index[0]]
     trades = []
-    skipped_trades = 0
-    
-    # SYSTEM FINE-TUNING CONSTANTS
-    MIN_RR_RATIO = 1.25     # Only take trades where Potential Profit is 1.25x larger than Potential Loss
-    SL_BUFFER = 1.50        # Tightened Stop Loss to $1.50 outside structural swing to improve R:R math
     
     for i in range(window*2, len(df)):
         close = df['Close'].iloc[i]
@@ -204,112 +185,78 @@ def run_macro_smc_backtest(df, start_capital, risk, window, current_live_price):
         total_range = high - low
         eq = high - (total_range * 0.50)
         
-        # TWEAK: Deep OTE (70.5% to 78.6%) to force a tighter Stop Loss distance
-        short_ote_low = high - (total_range * 0.295)
-        short_ote_high = high - (total_range * 0.114)
-        long_ote_high = low + (total_range * 0.295)
-        long_ote_low = low + (total_range * 0.114)
+        # Grid boundaries
+        short_618 = high - (total_range * 0.382)
+        short_786 = high - (total_range * 0.214)
+        long_618 = low + (total_range * 0.382)
+        long_786 = low + (total_range * 0.214)
         
         if not in_trade:
-            is_short_setup = (short_ote_low <= close <= short_ote_high) and close > eq
-            is_long_setup = (long_ote_low <= close <= long_ote_high) and close < eq
+            # Entry logic simulates a 3-tier grid triggering inside the zone
+            is_short_setup = (short_618 <= close <= short_786) and close > eq
+            is_long_setup = (long_618 <= close <= long_786) and close < eq
             
-            if is_short_setup and macro_bias == -1:
-                # Calculate metrics before execution
-                prop_sl = high + SL_BUFFER
-                prop_tp = low + (total_range * 0.236) # Asymmetric Target: 76.4% of range instead of 50%
-                
-                risk_dist = abs(close - prop_sl)
-                reward_dist = abs(close - prop_tp)
-                rr = reward_dist / risk_dist if risk_dist > 0 else 0
-                
-                # Minimum R:R Filter
-                if rr >= MIN_RR_RATIO:
-                    in_trade, trade_type = True, 'Short'
-                    entry_price, stop_loss, take_profit, entry_date = close, prop_sl, prop_tp, date
-                else:
-                    skipped_trades += 1
+            # Relaxed Macro: Allows trades on Neutral (0) days
+            if is_short_setup and macro_bias in [-1, 0]:
+                in_trade, trade_type = True, 'Short'
+                # Simulates the mathematically weighted average of a Martingale grid
+                blended_entry = high - (total_range * 0.25) 
+                stop_loss = high + 4.00 
+                take_profit = low  # Full structural target
+                entry_date = date
                     
-            elif is_long_setup and macro_bias == 1:
-                prop_sl = low - SL_BUFFER
-                prop_tp = high - (total_range * 0.236)
-                
-                risk_dist = abs(close - prop_sl)
-                reward_dist = abs(close - prop_tp)
-                rr = reward_dist / risk_dist if risk_dist > 0 else 0
-                
-                if rr >= MIN_RR_RATIO:
-                    in_trade, trade_type = True, 'Long'
-                    entry_price, stop_loss, take_profit, entry_date = close, prop_sl, prop_tp, date
-                else:
-                    skipped_trades += 1
-            else:
-                if is_short_setup or is_long_setup:
-                    skipped_trades += 1
+            elif is_long_setup and macro_bias in [1, 0]:
+                in_trade, trade_type = True, 'Long'
+                blended_entry = low + (total_range * 0.25)
+                stop_loss = low - 4.00 
+                take_profit = high # Full structural target
+                entry_date = date
                 
         elif in_trade:
-            risk_amt = equity * (risk / 100)
+            # In a grid, the total risk deployed is higher if all levels fill.
+            # We multiply base risk by 1.75 to simulate the heavy scaling.
+            deployed_risk = (equity * (risk_pct / 100)) * 1.75 
+            
             if trade_type == 'Short':
                 if curr_high >= stop_loss:
-                    equity -= risk_amt
-                    trades.append({'Date': date, 'Type': 'Short', 'Result': 'Loss', 'Entry': entry_price, 'Net': -risk_amt})
+                    equity -= deployed_risk
+                    trades.append({'Date': date, 'Type': 'Short', 'Result': 'Loss', 'Blended Entry': blended_entry, 'Net': -deployed_risk})
                     in_trade = False
                 elif curr_low <= take_profit:
-                    r_multiple = (entry_price - take_profit) / (stop_loss - entry_price)
-                    equity += risk_amt * r_multiple
-                    trades.append({'Date': date, 'Type': 'Short', 'Result': 'Win', 'Entry': entry_price, 'Net': risk_amt * r_multiple})
+                    r_multiple = (blended_entry - take_profit) / (stop_loss - blended_entry)
+                    equity += deployed_risk * r_multiple
+                    trades.append({'Date': date, 'Type': 'Short', 'Result': 'Win', 'Blended Entry': blended_entry, 'Net': deployed_risk * r_multiple})
                     in_trade = False
                     
             elif trade_type == 'Long':
                 if curr_low <= stop_loss:
-                    equity -= risk_amt
-                    trades.append({'Date': date, 'Type': 'Long', 'Result': 'Loss', 'Entry': entry_price, 'Net': -risk_amt})
+                    equity -= deployed_risk
+                    trades.append({'Date': date, 'Type': 'Long', 'Result': 'Loss', 'Blended Entry': blended_entry, 'Net': -deployed_risk})
                     in_trade = False
                 elif curr_high >= take_profit:
-                    r_multiple = (take_profit - entry_price) / (entry_price - stop_loss)
-                    equity += risk_amt * r_multiple
-                    trades.append({'Date': date, 'Type': 'Long', 'Result': 'Win', 'Entry': entry_price, 'Net': risk_amt * r_multiple})
+                    r_multiple = (take_profit - blended_entry) / (blended_entry - stop_loss)
+                    equity += deployed_risk * r_multiple
+                    trades.append({'Date': date, 'Type': 'Long', 'Result': 'Win', 'Blended Entry': blended_entry, 'Net': deployed_risk * r_multiple})
                     in_trade = False
                     
             if not in_trade:
                 equity_curve.append(equity)
                 dates.append(date)
 
-    active_position = None
-    if in_trade:
-        risk_dollar = equity * (risk / 100)
-        sl_dist = abs(entry_price - stop_loss)
-        lot_size = round(risk_dollar / (sl_dist * 100), 2) if sl_dist > 0 else 0.01 
-        
-        if trade_type == 'Short':
-            unrealized_pnl = (entry_price - current_live_price) * 100 * lot_size
-            rr = (entry_price - current_live_price) / sl_dist if sl_dist > 0 else 0.0
-        else:
-            unrealized_pnl = (current_live_price - entry_price) * 100 * lot_size
-            rr = (current_live_price - entry_price) / sl_dist if sl_dist > 0 else 0.0
-            
-        active_position = {
-            'is_open': True, 'type': trade_type, 'entry_price': entry_price, 'stop_loss': stop_loss,
-            'take_profit': take_profit, 'current_price': current_live_price, 'lot_size': lot_size,
-            'risk_dollar': risk_dollar, 'unrealized_pnl': unrealized_pnl, 'rr': rr
-        }
-                
     if dates[-1] != df.index[-1]:
         dates.append(df.index[-1])
         equity_curve.append(equity)
         
-    return trades, dates, equity_curve, skipped_trades, active_position
+    return trades, dates, equity_curve
 
 # --- 5. RENDER DASHBOARD ---
-df_unified, df_4h, df_1d, df_macro = fetch_unified_data()
+df_unified, df_4h, df_1d = fetch_unified_data()
 
 if not df_unified.empty and not df_1d.empty:
     sup_1d, res_1d = find_structural_levels(df_1d, window=7)
-    r1_1d, r2_1d, r3_1d, s1_1d, s2_1d, s3_1d = extract_key_levels(sup_1d, res_1d, live_price)
-    sup_4h, res_4h = find_structural_levels(df_4h, window=5)
-    r1_4h, r2_4h, r3_4h, s1_4h, s2_4h, s3_4h = extract_key_levels(sup_4h, res_4h, live_price)
+    r1_1d, r2_1d, s1_1d, s2_1d = extract_key_levels(sup_1d, res_1d, live_price)
     
-    trades, bt_dates, equity_curve, skipped, active_pos = run_macro_smc_backtest(df_unified, capital, risk_pct, bt_window, live_price)
+    trades, bt_dates, equity_curve = run_grid_backtest(df_unified, capital, risk_pct, bt_window)
     
     closed_df = df_unified.iloc[:-1]
     recent_high = float(closed_df['High'].tail(bt_window*2).max())
@@ -317,118 +264,64 @@ if not df_unified.empty and not df_1d.empty:
     total_range = recent_high - recent_low
     equilibrium = recent_high - (total_range * 0.50)
     
-    short_ote_low = recent_high - (total_range * 0.295)
-    short_ote_high = recent_high - (total_range * 0.114)
-    long_ote_high = recent_low + (total_range * 0.295)
-    long_ote_low = recent_low + (total_range * 0.114)
-    
     macro_sig = int(df_unified['Macro_Signal'].iloc[-1])
-    macro_text = "🟢 BULLISH (DXY/Yields Dropping)" if macro_sig == 1 else ("🔴 BEARISH (DXY/Yields Rising)" if macro_sig == -1 else "⚪ NEUTRAL")
-
-    st.subheader("⚡ Live Trade Execution Desk")
-
-    if active_pos and active_pos['is_open']:
-        if active_pos['type'] == 'Short': st.error(f"**ACTIVE POSITION IN PROGRESS: 🔴 SHORT GOLD**")
-        else: st.success(f"**ACTIVE POSITION IN PROGRESS: 🟢 LONG GOLD**")
-        
-        c1, c2, c3, c4, c5 = st.columns(5)
-        c1.metric("Execution Price", f"${active_pos['entry_price']:,.2f}")
-        c2.metric("Stop Loss", f"${active_pos['stop_loss']:,.2f}")
-        c3.metric("Take Profit (Target)", f"${active_pos['take_profit']:,.2f}")
-        c4.metric("Position Size", f"{active_pos['lot_size']} Lots")
-        c5.metric("Unrealized P&L", f"${active_pos['unrealized_pnl']:,.2f}", f"R:R {active_pos['rr']:.1f}:1")
+    
+    # Grid Levels Calculation
+    if live_price > equilibrium:
+        action = "Short"
+        l1 = recent_high - (total_range * 0.382) # 61.8%
+        l2 = recent_high - (total_range * 0.295) # 70.5%
+        l3 = recent_high - (total_range * 0.214) # 78.6%
+        sl = recent_high + 4.00
+        tp = recent_low
     else:
-        st.info("📡 **SCANNER STATUS: PENDING SETUP ORDERS BELOW**")
-        
-        if live_price > equilibrium:
-            setup_action, entry_zone = "🔴 PLACE SELL LIMIT ORDER", f"${short_ote_low:,.2f} – ${short_ote_high:,.2f}"
-            order_entry = short_ote_low
-            order_sl = recent_high + 1.50
-            order_tp = recent_low + (total_range * 0.236)
-            
-            risk_dist = abs(order_entry - order_sl)
-            reward_dist = abs(order_entry - order_tp)
-            rr = reward_dist / risk_dist if risk_dist > 0 else 0
-            filter_match = "Approved" if macro_sig == -1 and rr >= 1.25 else "Rejected (Poor R:R or Macro)"
-        else:
-            setup_action, entry_zone = "🟢 PLACE BUY LIMIT ORDER", f"${long_ote_low:,.2f} – ${long_ote_high:,.2f}"
-            order_entry = long_ote_high
-            order_sl = recent_low - 1.50
-            order_tp = recent_high - (total_range * 0.236)
-            
-            risk_dist = abs(order_entry - order_sl)
-            reward_dist = abs(order_entry - order_tp)
-            rr = reward_dist / risk_dist if risk_dist > 0 else 0
-            filter_match = "Approved" if macro_sig == 1 and rr >= 1.25 else "Rejected (Poor R:R or Macro)"
+        action = "Long"
+        l1 = recent_low + (total_range * 0.382) # 61.8%
+        l2 = recent_low + (total_range * 0.295) # 70.5%
+        l3 = recent_low + (total_range * 0.214) # 78.6%
+        sl = recent_low - 4.00
+        tp = recent_high
 
-        risk_dollars = capital * (risk_pct / 100)
-        calc_lots = round(risk_dollars / (risk_dist * 100), 2) if risk_dist > 0 else 0.01
+    # Base Lot Calculation (MT5 Standard)
+    base_risk_dollars = capital * (risk_pct / 100)
+    base_dist = abs(l1 - sl)
+    base_lots = round(base_risk_dollars / (base_dist * 100), 2) if base_dist > 0 else 0.01
 
-        c1, c2, c3, c4, c5 = st.columns(5)
-        c1.metric("Macro Alignment", macro_text, filter_match)
-        c2.metric("Optimal OTE Trigger", entry_zone, setup_action)
-        c3.metric("Structural Stop Loss", f"${order_sl:,.2f}")
-        c4.metric("Asymmetric Target", f"${order_tp:,.2f}")
-        c5.metric("Calculated Lot Size", f"{calc_lots} Lots", f"${risk_dollars:,.0f} Max Risk")
+    st.subheader("⚡ MT5 Grid Matrix Generator")
+    st.info(f"**Structural Setup:** Place 3 {action} Limit orders. As price moves deeper into the zone, the lot sizes multiply (Martingale scale) to heavily weight your average entry price.")
+
+    # MT5 Execution Table
+    grid_data = {
+        "Order Level": ["Entry 1 (61.8%)", "Entry 2 (70.5%)", "Entry 3 (78.6%)"],
+        "Execution Price": [f"${l1:,.2f}", f"${l2:,.2f}", f"${l3:,.2f}"],
+        "Multiplier": ["1x", "1.5x", "2x"],
+        "Lot Size": [f"{max(0.01, base_lots)} Lots", f"{max(0.02, round(base_lots*1.5, 2))} Lots", f"{max(0.03, round(base_lots*2, 2))} Lots"],
+        "Stop Loss": [f"${sl:,.2f}"] * 3,
+        "Take Profit": [f"${tp:,.2f}"] * 3
+    }
+    st.table(pd.DataFrame(grid_data))
 
     st.divider()
 
-    st.subheader("Multi-Timeframe Support & Resistance (Grid Strategy Zones)")
-    col1, col2 = st.columns(2)
-    with col1:
-        st.markdown("**Daily (D1) Macro Levels**")
-        st.write(f"Resistance 2: **${r2_1d:,.2f}**" if r2_1d else "Resistance 2: N/A")
-        st.write(f"Resistance 1: **${r1_1d:,.2f}**" if r1_1d else "Resistance 1: N/A")
-        st.write(f"Support 1: **${s1_1d:,.2f}**" if s1_1d else "Support 1: N/A")
-        st.write(f"Support 2: **${s2_1d:,.2f}**" if s2_1d else "Support 2: N/A")
-    with col2:
-        st.markdown("**4-Hour (4H) Swing Levels**")
-        st.write(f"Resistance 2: **${r2_4h:,.2f}**" if r2_4h else "Resistance 2: N/A")
-        st.write(f"Resistance 1: **${r1_4h:,.2f}**" if r1_4h else "Resistance 1: N/A")
-        st.write(f"Support 1: **${s1_4h:,.2f}**" if s1_4h else "Support 1: N/A")
-        st.write(f"Support 2: **${s2_4h:,.2f}**" if s2_4h else "Support 2: N/A")
-
-    st.divider()
-
-    tab1, tab2 = st.tabs(["📊 Unified 1H Strategy Chart", "📈 Institutional Backtest"])
+    tab1, tab2 = st.tabs(["📈 Scaled Institutional Backtest", "📊 Unified 1H Strategy Chart"])
 
     with tab1:
-        df_chart = df_unified.tail(120)
-        fig, ax = plt.subplots(figsize=(14, 6))
-        
-        ax.axhspan(equilibrium, recent_high, color='red', alpha=0.03, label="Premium Range")
-        ax.axhspan(recent_low, equilibrium, color='green', alpha=0.03, label="Discount Range")
-        ax.axhspan(short_ote_low, short_ote_high, color='darkred', alpha=0.15, label="Supply OTE (Sell Zone)")
-        ax.axhspan(long_ote_low, long_ote_high, color='darkgreen', alpha=0.15, label="Demand OTE (Buy Zone)")
-        
-        ax.plot(df_chart.index, df_chart['Close'], color='black', linewidth=1.5, label="Live Spot")
-        
-        if r1_4h: ax.axhline(r1_4h, color='purple', linestyle='--', alpha=0.4, label=f"4H R1 (${r1_4h:,.2f})")
-        if s1_4h: ax.axhline(s1_4h, color='blue', linestyle='--', alpha=0.4, label=f"4H S1 (${s1_4h:,.2f})")
-        
-        ax.xaxis.set_major_formatter(mdates.DateFormatter('%b %d - %H:%M'))
-        ax.set_ylabel('Spot Price (USD)')
-        ax.legend(loc='upper right', bbox_to_anchor=(1.20, 1))
-        ax.grid(alpha=0.2)
-        st.pyplot(fig)
-
-    with tab2:
         total_trades = len(trades)
         if total_trades > 0:
             win_rate = (len([t for t in trades if t['Result'] == 'Win']) / total_trades) * 100
             total_net = equity_curve[-1] - capital
+            ret_pct = (total_net / capital) * 100
             
             c1, c2, c3, c4 = st.columns(4)
-            c1.metric("Filter Interventions", skipped, help="SMC entries canceled due to conflicting Macro or Poor R:R.")
-            c2.metric("Closed Trades", total_trades)
-            c3.metric("System Win Rate", f"{win_rate:.1f}%")
+            c1.metric("Grid Sequences Closed", total_trades)
+            c2.metric("Grid Win Rate", f"{win_rate:.1f}%")
             
-            # Highlight positive return in green
             color_metric = f":green[${total_net:,.2f}]" if total_net > 0 else f":red[${total_net:,.2f}]"
-            c4.markdown(f"**Net Backtest Return**\n### {color_metric}")
+            c3.markdown(f"**Net Backtest Return**\n### {color_metric}")
+            c4.metric("Return on Equity", f"{ret_pct:.1f}%")
             
             fig2, ax2 = plt.subplots(figsize=(14, 4))
-            ax2.plot(bt_dates, equity_curve, color='teal', linewidth=2, label="Strategy Equity")
+            ax2.plot(bt_dates, equity_curve, color='teal', linewidth=2, label="Aggressive Grid Equity")
             ax2.axhline(capital, color='black', linestyle='--', linewidth=1)
             ax2.xaxis.set_major_formatter(mdates.DateFormatter('%b %Y'))
             ax2.set_ylabel('Equity ($)')
@@ -437,6 +330,26 @@ if not df_unified.empty and not df_1d.empty:
             
             st.dataframe(pd.DataFrame(trades).iloc[::-1], use_container_width=True, hide_index=True)
         else:
-            st.warning("No trades triggered under current strict parameter configuration.")
+            st.warning("No grid sequences triggered under current lookback settings.")
+
+    with tab2:
+        df_chart = df_unified.tail(120)
+        fig, ax = plt.subplots(figsize=(14, 6))
+        
+        ax.axhspan(equilibrium, recent_high, color='red', alpha=0.03, label="Premium Range")
+        ax.axhspan(recent_low, equilibrium, color='green', alpha=0.03, label="Discount Range")
+        
+        ax.plot(df_chart.index, df_chart['Close'], color='black', linewidth=1.5, label="Live Spot")
+        
+        # Plot the 3 Grid Lines
+        ax.axhline(l1, color='orange', linestyle=':', label='Grid 1 (61.8%)')
+        ax.axhline(l2, color='darkorange', linestyle='--', label='Grid 2 (70.5%)')
+        ax.axhline(l3, color='red' if action == 'Short' else 'green', linestyle='-', label='Grid 3 (78.6%)')
+        
+        ax.xaxis.set_major_formatter(mdates.DateFormatter('%b %d - %H:%M'))
+        ax.set_ylabel('Spot Price (USD)')
+        ax.legend(loc='upper right', bbox_to_anchor=(1.20, 1))
+        ax.grid(alpha=0.2)
+        st.pyplot(fig)
 else:
     st.error("Market data feeds are currently unreachable.")
