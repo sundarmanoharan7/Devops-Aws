@@ -162,7 +162,9 @@ def fetch_unified_data():
 
         df_4h = df_1h.resample('4h').agg({'Open': 'first', 'High': 'max', 'Low': 'min', 'Close': 'last'}).dropna()
         
-        df_1h['Date_Only'] = df_1h.index.normalize()
+        # CRITICAL FIX: Strip timezone from the index before assigning to Date_Only for merging
+        df_1h['Date_Only'] = df_1h.index.tz_localize(None).normalize()
+        
         if not df_macro.empty:
             df_unified = pd.merge(df_1h, df_macro[['Date_Only', 'Macro_Signal']], on='Date_Only', how='left')
             df_unified.index = df_1h.index
