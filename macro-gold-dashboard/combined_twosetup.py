@@ -212,10 +212,10 @@ def run_macro_smc_backtest(df, start_capital, risk, window, current_live_price):
         
         if trade_type == 'Short':
             unrealized_pnl = (entry_price - current_live_price) * 100 * lot_size
-            rr = (entry_price - take_profit) / sl_dist if sl_dist > 0 else 0.0
+            rr = (entry_price - current_live_price) / sl_dist if sl_dist > 0 else 0.0
         else:
             unrealized_pnl = (current_live_price - entry_price) * 100 * lot_size
-            rr = (take_profit - entry_price) / sl_dist if sl_dist > 0 else 0.0
+            rr = (current_live_price - entry_price) / sl_dist if sl_dist > 0 else 0.0
             
         active_position = {
             'is_open': True,
@@ -268,16 +268,19 @@ if not df_unified.empty:
 
     if active_pos and active_pos['is_open']:
         pos_badge = "🟢 LONG" if active_pos['type'] == 'Long' else "🔴 SHORT"
-        pnl_color = "green" if active_pos['unrealized_pnl'] >= 0 else "red"
         
-        st.error(f"**ACTIVE POSITION IN PROGRESS: {pos_badge} GOLD**") if active_pos['type'] == 'Short' else st.success(f"**ACTIVE POSITION IN PROGRESS: {pos_badge} GOLD**")
+        # FIX: Explicit if/else statement to prevent Streamlit document dump
+        if active_pos['type'] == 'Short':
+            st.error(f"**ACTIVE POSITION IN PROGRESS: {pos_badge} GOLD**")
+        else:
+            st.success(f"**ACTIVE POSITION IN PROGRESS: {pos_badge} GOLD**")
         
         c1, c2, c3, c4, c5 = st.columns(5)
         c1.metric("Execution Price", f"${active_pos['entry_price']:,.2f}", f"Live: ${active_pos['current_price']:,.2f}")
         c2.metric("Hard Stop Loss", f"${active_pos['stop_loss']:,.2f}", f"-${abs(active_pos['entry_price'] - active_pos['stop_loss']):.2f} pts")
         c3.metric("Take Profit (Target)", f"${active_pos['take_profit']:,.2f}", f"+${abs(active_pos['take_profit'] - active_pos['entry_price']):.2f} pts")
         c4.metric("Position Size", f"{active_pos['lot_size']} Lots", f"Risk: ${active_pos['risk_dollar']:,.0f}")
-        c5.metric("Unrealized P&L", f"${active_pos['unrealized_pnl']:,.2f}", f"R:R {active_pos['rr']:.1f}:1")
+        c5.metric("Unrealized P&L", f"${active_pos['unrealized_pnl']:,.2f}", f"Current R:R {active_pos['rr']:.1f}:1")
         
         st.caption(f"Entry Timestamp: {active_pos['entry_date'].strftime('%b %d, %Y - %H:%M UTC')} | Manage trade in MT5 according to structural SL/TP.")
     else:
