@@ -55,7 +55,7 @@ bt_window = st.sidebar.slider("SMC Structural Lookback (1H)", 5, 30, 15)
 
 # --- 2. UNIFIED DATA PIPELINE (MACRO + SMC) ---
 @st.cache_data(ttl=300)
-def fetch_unified_data(anchor_spot: float):
+def fetch_unified_data():
     # A. Macro Data (DXY + 10Y Yield)
     df_macro = pd.DataFrame()
     try:
@@ -83,7 +83,7 @@ def fetch_unified_data(anchor_spot: float):
             df_macro['Date_Only'] = df_macro.index.normalize()
     except Exception: pass
 
-    # B. Hourly Chart Data (Aligned to live spot)
+    # B. Hourly Chart Data (Pure Spot History - NO SPREAD SHIFTING)
     df_smc = pd.DataFrame()
     try:
         df_smc = yf.download("XAUUSD=X", period="6mo", interval="1h", progress=False)
@@ -101,11 +101,6 @@ def fetch_unified_data(anchor_spot: float):
         if df_smc.index.tz is not None: df_smc.index = df_smc.index.tz_localize(None)
         df_smc.dropna(inplace=True)
 
-        active_hist_bar = float(df_smc['Close'].iloc[-1])
-        spread = active_hist_bar - anchor_spot
-        for col in ['Open', 'High', 'Low', 'Close']:
-            df_smc[col] = df_smc[col] - spread
-
         df_smc['Date_Only'] = df_smc.index.normalize()
         if not df_macro.empty:
             df_unified = pd.merge(df_smc, df_macro[['Date_Only', 'Macro_Signal']], on='Date_Only', how='left')
@@ -122,8 +117,9 @@ def fetch_unified_data(anchor_spot: float):
 # --- 3. FILTERED BACKTEST & ACTIVE POSITION TRACKER ---
 def run_macro_smc_backtest(df, start_capital, risk, window, current_live_price):
     df = df.copy()
-    df['Swing_High'] = df['High'].rolling(window=window*2, center=True).max().ffill()
-    df['Swing_Low'] = df['Low'].rolling(window=window*2, center=True).min().ffill()
+    # Fixed lookahead repainting by setting center=False for structural fidelity
+    df['Swing_High'] = df['High'].rolling(window=window*2, center=False).max().ffill()
+    df['Swing_Low'] = df['Low'].rolling(window=window*2, center=False).min().ffill()
     
     in_trade = False
     trade_type = None
@@ -136,7 +132,7 @@ def run_macro_smc_backtest(df, start_capital, risk, window, current_live_price):
     trades = []
     skipped_trades = 0
     
-    for i in range(window, len(df)):
+    for i in range(window*2, len(df)):
         close = df['Close'].iloc[i]
         curr_high = df['High'].iloc[i]
         curr_low = df['Low'].iloc[i]
@@ -238,7 +234,7 @@ def run_macro_smc_backtest(df, start_capital, risk, window, current_live_price):
     return trades, dates, equity_curve, skipped_trades, active_position
 
 # --- 4. RENDER DASHBOARD ---
-df_unified, df_macro = fetch_unified_data(live_price)
+df_unified, df_macro = fetch_unified_data()
 
 if not df_unified.empty:
     trades, bt_dates, equity_curve, skipped, active_pos = run_macro_smc_backtest(
@@ -269,7 +265,6 @@ if not df_unified.empty:
     if active_pos and active_pos['is_open']:
         pos_badge = "🟢 LONG" if active_pos['type'] == 'Long' else "🔴 SHORT"
         
-        # FIX: Explicit if/else statement to prevent Streamlit document dump
         if active_pos['type'] == 'Short':
             st.error(f"**ACTIVE POSITION IN PROGRESS: {pos_badge} GOLD**")
         else:
@@ -293,7 +288,6 @@ if not df_unified.empty:
             order_entry = short_ote_low
             order_sl = recent_high + 2.50
             order_tp = recent_low
-            order_type = "Short"
         else:
             valuation = "DISCOUNT (Buy Setup Forming)"
             setup_action = "🟢 PLACE BUY LIMIT ORDER"
@@ -301,7 +295,6 @@ if not df_unified.empty:
             order_entry = long_ote_high
             order_sl = recent_low - 2.50
             order_tp = recent_high
-            order_type = "Long"
 
         sl_distance = abs(order_entry - order_sl)
         risk_dollars = capital * (risk_pct / 100)
