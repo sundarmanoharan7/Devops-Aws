@@ -3,6 +3,7 @@ import yfinance as yf
 import pandas as pd
 import numpy as np
 from scipy.signal import argrelextrema
+import matplotlib.subplots as plt_sub
 import matplotlib.pyplot as plt
 import matplotlib.dates as mdates
 from tvDatafeed import TvDatafeed, Interval
@@ -77,7 +78,8 @@ h1_view_days = st.sidebar.slider(
 
 # --- BULLETPROOF DATA FETCHING & ALIGNMENT ---
 @st.cache_data(ttl=120)
-def fetch_and_align_market_data(anchor_spot: float):
+def fetch_market_data():
+    """Fetches pure, unshifted structural market data."""
     df_1h, df_1d = pd.DataFrame(), pd.DataFrame()
     
     # ATTEMPT 1: TradingView API (Iterating through unblocked exchanges)
@@ -125,7 +127,7 @@ def fetch_and_align_market_data(anchor_spot: float):
             df_1d = yf.download("XAUUSD=X", period="1y", interval="1d", progress=False)
         except: pass
 
-    # Clean and perfectly align to the active Live TV Spot Anchor
+    # Clean the Data (Offset Math Removed Entirely)
     if df_1h is not None and not df_1h.empty and df_1d is not None and not df_1d.empty:
         for df in [df_1h, df_1d]:
             if isinstance(df.columns, pd.MultiIndex): df.columns = df.columns.get_level_values(0)
@@ -135,16 +137,7 @@ def fetch_and_align_market_data(anchor_spot: float):
             else:
                 df.index = df.index.tz_convert('UTC')
                 
-        # Offset Math: Snaps any slight API variances perfectly to the $4,197 TV Feed
-        active_historical_bar = float(df_1h['Close'].dropna().iloc[-1])
-        basis_offset = active_historical_bar - anchor_spot
-        
-        for df in [df_1h, df_1d]:
-            for col in ['Open', 'High', 'Low', 'Close']:
-                if col in df.columns:
-                    df[col] = df[col] - basis_offset
-                    
-        # Resample the calibrated 1H candles into clean 4H candles
+        # Resample the 1H candles into clean 4H candles
         df_4h = df_1h.resample('4h').agg({
             'Open': 'first',
             'High': 'max',
@@ -156,13 +149,16 @@ def fetch_and_align_market_data(anchor_spot: float):
         
     return pd.DataFrame(), pd.DataFrame(), pd.DataFrame()
 
-# --- LEVEL DETECTION ---
+# --- LEVEL DETECTION (LOCKED TO CLOSED CANDLES) ---
 def find_structural_levels(df, window=5):
-    maxima_indices = argrelextrema(df['High'].values, np.greater, order=window)[0]
-    resistances = df['High'].iloc[maxima_indices].values
+    # CRITICAL FIX: Slicing out the active unclosed candle prevents repainting
+    closed_df = df.iloc[:-1]
     
-    minima_indices = argrelextrema(df['Low'].values, np.less, order=window)[0]
-    supports = df['Low'].iloc[minima_indices].values
+    maxima_indices = argrelextrema(closed_df['High'].values, np.greater, order=window)[0]
+    resistances = closed_df['High'].iloc[maxima_indices].values
+    
+    minima_indices = argrelextrema(closed_df['Low'].values, np.less, order=window)[0]
+    supports = closed_df['Low'].iloc[minima_indices].values
     
     return supports, resistances
 
@@ -189,7 +185,7 @@ def shade_london_ny_overlap(ax, df_subset):
             shaded_label_added = True
 
 # --- RENDER DASHBOARD ---
-df_1h, df_4h, df_1d = fetch_and_align_market_data(detected_spot)
+df_1h, df_4h, df_1d = fetch_market_data()
 
 if not df_1h.empty and not df_1d.empty:
     current_price = detected_spot
