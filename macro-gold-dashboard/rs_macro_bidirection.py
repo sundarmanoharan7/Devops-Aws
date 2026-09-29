@@ -17,6 +17,14 @@ st.title("Macro-SMC Unified Alpha Engine & Execution Desk")
 
 CURRENT_CPI = 3.35  # Static CPI baseline
 
+# --- INITIALIZE TRADINGVIEW CONNECTION ---
+@st.cache_resource
+def get_tv_connection():
+    try:
+        return TvDatafeed()
+    except Exception:
+        return None
+
 # --- 1. CLOUD-RESILIENT LIVE SPOT FETCHER ---
 @st.cache_data(ttl=15)
 def get_live_xauusd_spot():
