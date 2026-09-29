@@ -17,14 +17,6 @@ st.title("Macro-SMC Unified Alpha Engine & Execution Desk")
 
 CURRENT_CPI = 3.35  # Static CPI baseline
 
-# --- INITIALIZE TRADINGVIEW CONNECTION ---
-@st.cache_resource
-def get_tv_connection():
-    try:
-        return TvDatafeed()
-    except Exception:
-        return None
-
 # --- 1. CLOUD-RESILIENT LIVE SPOT FETCHER ---
 @st.cache_data(ttl=15)
 def get_live_xauusd_spot():
@@ -61,6 +53,14 @@ def get_live_xauusd_spot():
     return 4197.50
 
 live_price = get_live_xauusd_spot()
+
+# --- INITIALIZE TRADINGVIEW CONNECTION ---
+@st.cache_resource
+def get_tv_connection():
+    try:
+        return TvDatafeed()
+    except Exception:
+        return None
 
 # --- SIDEBAR CONTROLS ---
 st.sidebar.header("Execution Parameters")
@@ -101,23 +101,57 @@ def fetch_unified_data():
             df_macro['Date_Only'] = df_macro.index.normalize()
     except: pass
 
-    # B. Gold Historical Spot Data
+    # B. Gold Historical Spot Data (With Full Crypto Cascade Fallbacks)
     df_1h, df_1d = pd.DataFrame(), pd.DataFrame()
     tv = get_tv_connection()
     
+    # ATTEMPT 1: TradingView
     if tv is not None:
+        exchanges = ['FXCM', 'OANDA', 'FOREXCOM']
+        for exc in exchanges:
+            try:
+                df_1h = tv.get_hist(symbol='XAUUSD', exchange=exc, interval=Interval.in_1_hour, n_bars=1500)
+                df_1d = tv.get_hist(symbol='XAUUSD', exchange=exc, interval=Interval.in_daily, n_bars=300)
+                if df_1h is not None and not df_1h.empty and df_1d is not None and not df_1d.empty:
+                    break
+            except: continue
+
+    # ATTEMPT 2: MEXC PAXGUSDT
+    if df_1h is None or df_1h.empty or df_1d is None or df_1d.empty:
         try:
-            df_1h = tv.get_hist(symbol='XAUUSD', exchange='FXCM', interval=Interval.in_1_hour, n_bars=1500)
-            df_1d = tv.get_hist(symbol='XAUUSD', exchange='FXCM', interval=Interval.in_daily, n_bars=300)
+            r1h = requests.get("https://api.mexc.com/api/v3/klines?symbol=PAXGUSDT&interval=60m&limit=1000", timeout=5).json()
+            d1h = pd.DataFrame(r1h, columns=['time', 'open', 'high', 'low', 'close', 'v', 'ct', 'qav', 'nt', 'tbb', 'tbq'])
+            d1h['time'] = pd.to_datetime(d1h['time'].astype(int), unit='ms', utc=True)
+            df_1h = d1h[['time', 'open', 'high', 'low', 'close']].set_index('time').astype(float).sort_index()
+
+            r1d = requests.get("https://api.mexc.com/api/v3/klines?symbol=PAXGUSDT&interval=1d&limit=300", timeout=5).json()
+            d1d = pd.DataFrame(r1d, columns=['time', 'open', 'high', 'low', 'close', 'v', 'ct', 'qav', 'nt', 'tbb', 'tbq'])
+            d1d['time'] = pd.to_datetime(d1d['time'].astype(int), unit='ms', utc=True)
+            df_1d = d1d[['time', 'open', 'high', 'low', 'close']].set_index('time').astype(float).sort_index()
         except: pass
 
-    if df_1h is None or df_1h.empty:
+    # ATTEMPT 3: KuCoin PAXG-USDT
+    if df_1h is None or df_1h.empty or df_1d is None or df_1d.empty:
+        try:
+            r1h = requests.get("https://api.kucoin.com/api/v1/market/candles?type=1hour&symbol=PAXG-USDT", timeout=5).json()
+            d1h = pd.DataFrame(r1h['data'], columns=['time', 'open', 'close', 'high', 'low', 'v', 't'])
+            d1h['time'] = pd.to_datetime(d1h['time'].astype(int), unit='s', utc=True)
+            df_1h = d1h[['time', 'open', 'high', 'low', 'close']].set_index('time').astype(float).sort_index()
+
+            r1d = requests.get("https://api.kucoin.com/api/v1/market/candles?type=1day&symbol=PAXG-USDT", timeout=5).json()
+            d1d = pd.DataFrame(r1d['data'], columns=['time', 'open', 'close', 'high', 'low', 'v', 't'])
+            d1d['time'] = pd.to_datetime(d1d['time'].astype(int), unit='s', utc=True)
+            df_1d = d1d[['time', 'open', 'high', 'low', 'close']].set_index('time').astype(float).sort_index()
+        except: pass
+
+    # ATTEMPT 4: yfinance
+    if df_1h is None or df_1h.empty or df_1d is None or df_1d.empty:
         try:
             df_1h = yf.download("XAUUSD=X", period="60d", interval="1h", progress=False)
             df_1d = yf.download("XAUUSD=X", period="1y", interval="1d", progress=False)
         except: pass
 
-    if df_1h is not None and not df_1h.empty:
+    if df_1h is not None and not df_1h.empty and df_1d is not None and not df_1d.empty:
         for df in [df_1h, df_1d]:
             if isinstance(df.columns, pd.MultiIndex): df.columns = df.columns.get_level_values(0)
             df.rename(columns=lambda x: x.capitalize() if isinstance(x, str) else x, inplace=True)
