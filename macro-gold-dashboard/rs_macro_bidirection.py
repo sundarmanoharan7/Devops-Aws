@@ -12,8 +12,8 @@ import logging
 # Silence TradingView login warnings
 logging.getLogger('tvDatafeed').setLevel(logging.ERROR)
 
-st.set_page_config(page_title="Macro-SMC Unified Alpha Engine", layout="wide")
-st.title("Macro-SMC Unified Alpha Engine & Execution Desk")
+st.set_page_config(page_title="Macro-SMC High-Win Rate Engine", layout="wide")
+st.title("High-Probability SMC Engine & Execution Desk")
 
 CURRENT_CPI = 3.35  # Static CPI baseline
 
@@ -21,8 +21,6 @@ CURRENT_CPI = 3.35  # Static CPI baseline
 @st.cache_data(ttl=15)
 def get_live_xauusd_spot():
     headers = {'User-Agent': 'Mozilla/5.0'}
-    
-    # Priority 1: TradingView CFD Scanner (Exact FXCM Match)
     try:
         url = "https://scanner.tradingview.com/cfd/scan"
         payload = {"symbols": {"tickers": ["FXCM:XAUUSD", "OANDA:XAUUSD"]}, "columns": ["close"]}
@@ -32,7 +30,6 @@ def get_live_xauusd_spot():
             if price > 1000: return float(price)
     except: pass
     
-    # Priority 2: KuCoin PAXG-USDT (1:1 Gold Peg)
     try:
         url = "https://api.kucoin.com/api/v1/market/orderbook/level1?symbol=PAXG-USDT"
         res = requests.get(url, timeout=3)
@@ -41,7 +38,6 @@ def get_live_xauusd_spot():
             if price and float(price) > 1000: return float(price)
     except: pass
 
-    # Priority 3: MEXC PAXGUSDT
     try:
         url = "https://api.mexc.com/api/v3/ticker/price?symbol=PAXGUSDT"
         res = requests.get(url, timeout=3)
@@ -73,7 +69,6 @@ bt_window = st.sidebar.slider("Structural Swing Lookback", 5, 30, 15)
 # --- 2. UNIFIED DATA PIPELINE (MACRO + STRUCTURAL) ---
 @st.cache_data(ttl=300)
 def fetch_unified_data():
-    # A. Macro Data (DXY + 10Y Yield)
     df_macro = pd.DataFrame()
     try:
         tickers = {"DX-Y.NYB": "DXY", "^TNX": "Nominal_10Y"}
@@ -92,7 +87,6 @@ def fetch_unified_data():
             df_macro['DXY_SMA20'] = df_macro['DXY'].rolling(window=20).mean()
             df_macro['Yield_SMA20'] = df_macro['Real_Yield'].rolling(window=20).mean()
             
-            # Trend alignment matrix
             bull = (df_macro['DXY'] < df_macro['DXY_SMA20']) & (df_macro['Real_Yield'] < df_macro['Yield_SMA20'])
             bear = (df_macro['DXY'] > df_macro['DXY_SMA20']) & (df_macro['Real_Yield'] > df_macro['Yield_SMA20'])
             df_macro['Macro_Signal'] = np.select([bull, bear], [1, -1], default=0)
@@ -101,11 +95,9 @@ def fetch_unified_data():
             df_macro['Date_Only'] = df_macro.index.normalize()
     except: pass
 
-    # B. Gold Historical Spot Data (With Full Crypto Cascade Fallbacks)
     df_1h, df_1d = pd.DataFrame(), pd.DataFrame()
     tv = get_tv_connection()
     
-    # ATTEMPT 1: TradingView
     if tv is not None:
         exchanges = ['FXCM', 'OANDA', 'FOREXCOM']
         for exc in exchanges:
@@ -116,7 +108,6 @@ def fetch_unified_data():
                     break
             except: continue
 
-    # ATTEMPT 2: MEXC PAXGUSDT
     if df_1h is None or df_1h.empty or df_1d is None or df_1d.empty:
         try:
             r1h = requests.get("https://api.mexc.com/api/v3/klines?symbol=PAXGUSDT&interval=60m&limit=1000", timeout=5).json()
@@ -130,21 +121,6 @@ def fetch_unified_data():
             df_1d = d1d[['time', 'open', 'high', 'low', 'close']].set_index('time').astype(float).sort_index()
         except: pass
 
-    # ATTEMPT 3: KuCoin PAXG-USDT
-    if df_1h is None or df_1h.empty or df_1d is None or df_1d.empty:
-        try:
-            r1h = requests.get("https://api.kucoin.com/api/v1/market/candles?type=1hour&symbol=PAXG-USDT", timeout=5).json()
-            d1h = pd.DataFrame(r1h['data'], columns=['time', 'open', 'close', 'high', 'low', 'v', 't'])
-            d1h['time'] = pd.to_datetime(d1h['time'].astype(int), unit='s', utc=True)
-            df_1h = d1h[['time', 'open', 'high', 'low', 'close']].set_index('time').astype(float).sort_index()
-
-            r1d = requests.get("https://api.kucoin.com/api/v1/market/candles?type=1day&symbol=PAXG-USDT", timeout=5).json()
-            d1d = pd.DataFrame(r1d['data'], columns=['time', 'open', 'close', 'high', 'low', 'v', 't'])
-            d1d['time'] = pd.to_datetime(d1d['time'].astype(int), unit='s', utc=True)
-            df_1d = d1d[['time', 'open', 'high', 'low', 'close']].set_index('time').astype(float).sort_index()
-        except: pass
-
-    # ATTEMPT 4: yfinance
     if df_1h is None or df_1h.empty or df_1d is None or df_1d.empty:
         try:
             df_1h = yf.download("XAUUSD=X", period="60d", interval="1h", progress=False)
@@ -162,9 +138,7 @@ def fetch_unified_data():
 
         df_4h = df_1h.resample('4h').agg({'Open': 'first', 'High': 'max', 'Low': 'min', 'Close': 'last'}).dropna()
         
-        # CRITICAL FIX: Strip timezone from the index before assigning to Date_Only for merging
         df_1h['Date_Only'] = df_1h.index.tz_localize(None).normalize()
-        
         if not df_macro.empty:
             df_unified = pd.merge(df_1h, df_macro[['Date_Only', 'Macro_Signal']], on='Date_Only', how='left')
             df_unified.index = df_1h.index
@@ -177,7 +151,7 @@ def fetch_unified_data():
 
     return pd.DataFrame(), pd.DataFrame(), pd.DataFrame(), pd.DataFrame()
 
-# --- 3. S/R LEVEL EXTRACTION (LOCKED TO CLOSED CANDLES) ---
+# --- 3. S/R LEVEL EXTRACTION ---
 def find_structural_levels(df, window=5):
     closed_df = df.iloc[:-1]
     maxima_indices = argrelextrema(closed_df['High'].values, np.greater, order=window)[0]
@@ -201,7 +175,7 @@ def extract_key_levels(supports_all, resistances_all, current_price):
     
     return r1, r2, r3, s1, s2, s3
 
-# --- 4. FILTERED BIDIRECTIONAL BACKTEST ENGINE ---
+# --- 4. HIGH-PROBABILITY BACKTEST ENGINE (>70% TARGET) ---
 def run_macro_smc_backtest(df, start_capital, risk, window, current_live_price):
     df = df.copy()
     df['Swing_High'] = df['High'].rolling(window=window*2, center=False).max().ffill()
@@ -241,18 +215,24 @@ def run_macro_smc_backtest(df, start_capital, risk, window, current_live_price):
             is_short_setup = (short_ote_low <= close <= short_ote_high) and close > eq
             is_long_setup = (long_ote_low <= close <= long_ote_high) and close < eq
             
-            if is_short_setup:
-                if macro_bias in [-1, 0]: # Macro Agrees or Neutral
-                    in_trade, trade_type = True, 'Short'
-                    entry_price, stop_loss, take_profit, entry_date = close, high + 2.50, low, date
-                else: 
-                    skipped_trades += 1
+            # HIGH PROBABILITY TWEAK 1: Strict Macro Only (No Neutral)
+            if is_short_setup and macro_bias == -1:
+                in_trade, trade_type = True, 'Short'
+                entry_price = close
+                # HIGH PROBABILITY TWEAK 2: $5.00 Stop-Hunt Buffer + Mean Reversion Target (Equilibrium)
+                stop_loss = high + 5.00 
+                take_profit = eq 
+                entry_date = date
                     
-            elif is_long_setup:
-                if macro_bias in [1, 0]: # Macro Agrees or Neutral
-                    in_trade, trade_type = True, 'Long'
-                    entry_price, stop_loss, take_profit, entry_date = close, low - 2.50, high, date
-                else: 
+            elif is_long_setup and macro_bias == 1:
+                in_trade, trade_type = True, 'Long'
+                entry_price = close
+                # HIGH PROBABILITY TWEAK 2: $5.00 Stop-Hunt Buffer + Mean Reversion Target (Equilibrium)
+                stop_loss = low - 5.00 
+                take_profit = eq 
+                entry_date = date
+            else:
+                if is_short_setup or is_long_setup:
                     skipped_trades += 1
                 
         elif in_trade:
@@ -310,13 +290,11 @@ def run_macro_smc_backtest(df, start_capital, risk, window, current_live_price):
 df_unified, df_4h, df_1d, df_macro = fetch_unified_data()
 
 if not df_unified.empty and not df_1d.empty:
-    # Generate Multi-Timeframe S/R
     sup_1d, res_1d = find_structural_levels(df_1d, window=7)
     r1_1d, r2_1d, r3_1d, s1_1d, s2_1d, s3_1d = extract_key_levels(sup_1d, res_1d, live_price)
     sup_4h, res_4h = find_structural_levels(df_4h, window=5)
     r1_4h, r2_4h, r3_4h, s1_4h, s2_4h, s3_4h = extract_key_levels(sup_4h, res_4h, live_price)
     
-    # Process Backtest & Setup
     trades, bt_dates, equity_curve, skipped, active_pos = run_macro_smc_backtest(df_unified, capital, risk_pct, bt_window, live_price)
     
     closed_df = df_unified.iloc[:-1]
@@ -333,7 +311,6 @@ if not df_unified.empty and not df_1d.empty:
     macro_sig = int(df_unified['Macro_Signal'].iloc[-1])
     macro_text = "🟢 BULLISH (DXY/Yields Dropping)" if macro_sig == 1 else ("🔴 BEARISH (DXY/Yields Rising)" if macro_sig == -1 else "⚪ NEUTRAL")
 
-    # --- TOP EXECUTION DESK ---
     st.subheader("⚡ Live Trade Execution Desk")
 
     if active_pos and active_pos['is_open']:
@@ -343,21 +320,20 @@ if not df_unified.empty and not df_1d.empty:
         c1, c2, c3, c4, c5 = st.columns(5)
         c1.metric("Execution Price", f"${active_pos['entry_price']:,.2f}")
         c2.metric("Stop Loss", f"${active_pos['stop_loss']:,.2f}")
-        c3.metric("Take Profit", f"${active_pos['take_profit']:,.2f}")
+        c3.metric("Take Profit (Fair Value)", f"${active_pos['take_profit']:,.2f}")
         c4.metric("Position Size", f"{active_pos['lot_size']} Lots")
         c5.metric("Unrealized P&L", f"${active_pos['unrealized_pnl']:,.2f}", f"R:R {active_pos['rr']:.1f}:1")
     else:
         st.info("📡 **SCANNER STATUS: PENDING SETUP ORDERS BELOW**")
         
-        # Determine actionable setup
         if live_price > equilibrium:
             setup_action, entry_zone = "🔴 PLACE SELL LIMIT ORDER", f"${short_ote_low:,.2f} – ${short_ote_high:,.2f}"
-            order_entry, order_sl, order_tp = short_ote_low, recent_high + 2.50, recent_low
-            filter_match = "Approved" if macro_sig in [-1, 0] else "Rejected by Macro Filter"
+            order_entry, order_sl, order_tp = short_ote_low, recent_high + 5.00, equilibrium
+            filter_match = "Approved" if macro_sig == -1 else "Rejected by Macro Filter"
         else:
             setup_action, entry_zone = "🟢 PLACE BUY LIMIT ORDER", f"${long_ote_low:,.2f} – ${long_ote_high:,.2f}"
-            order_entry, order_sl, order_tp = long_ote_high, recent_low - 2.50, recent_high
-            filter_match = "Approved" if macro_sig in [1, 0] else "Rejected by Macro Filter"
+            order_entry, order_sl, order_tp = long_ote_high, recent_low - 5.00, equilibrium
+            filter_match = "Approved" if macro_sig == 1 else "Rejected by Macro Filter"
 
         sl_distance = abs(order_entry - order_sl)
         risk_dollars = capital * (risk_pct / 100)
@@ -367,12 +343,11 @@ if not df_unified.empty and not df_1d.empty:
         c1.metric("Macro Alignment", macro_text, filter_match)
         c2.metric("Optimal OTE Trigger", entry_zone, setup_action)
         c3.metric("Structural Stop Loss", f"${order_sl:,.2f}")
-        c4.metric("Structural Target (TP)", f"${order_tp:,.2f}")
+        c4.metric("Mean Reversion Target", f"${order_tp:,.2f}")
         c5.metric("Calculated Lot Size", f"{calc_lots} Lots", f"${risk_dollars:,.0f} Max Risk")
 
     st.divider()
 
-    # --- MULTI-TIMEFRAME S/R MATRIX ---
     st.subheader("Multi-Timeframe Support & Resistance (Grid Strategy Zones)")
     col1, col2 = st.columns(2)
     with col1:
@@ -390,23 +365,19 @@ if not df_unified.empty and not df_1d.empty:
 
     st.divider()
 
-    # --- CHARTS & BACKTEST ---
     tab1, tab2 = st.tabs(["📊 Unified 1H Strategy Chart", "📈 Institutional Backtest"])
 
     with tab1:
         df_chart = df_unified.tail(120)
         fig, ax = plt.subplots(figsize=(14, 6))
         
-        # OTE & Dealing Range
         ax.axhspan(equilibrium, recent_high, color='red', alpha=0.03, label="Premium Range")
         ax.axhspan(recent_low, equilibrium, color='green', alpha=0.03, label="Discount Range")
         ax.axhspan(short_ote_low, short_ote_high, color='darkred', alpha=0.15, label="Supply OTE (Sell Zone)")
         ax.axhspan(long_ote_low, long_ote_high, color='darkgreen', alpha=0.15, label="Demand OTE (Buy Zone)")
         
-        # Price
         ax.plot(df_chart.index, df_chart['Close'], color='black', linewidth=1.5, label="Live Spot")
         
-        # S/R Overlay (Faint to prevent clutter)
         if r1_4h: ax.axhline(r1_4h, color='purple', linestyle='--', alpha=0.4, label=f"4H R1 (${r1_4h:,.2f})")
         if s1_4h: ax.axhline(s1_4h, color='blue', linestyle='--', alpha=0.4, label=f"4H S1 (${s1_4h:,.2f})")
         
@@ -438,6 +409,6 @@ if not df_unified.empty and not df_1d.empty:
             
             st.dataframe(pd.DataFrame(trades).iloc[::-1], use_container_width=True, hide_index=True)
         else:
-            st.warning("No trades triggered under current parameter configuration.")
+            st.warning("No trades triggered under current strict parameter configuration.")
 else:
     st.error("Market data feeds are currently unreachable.")
