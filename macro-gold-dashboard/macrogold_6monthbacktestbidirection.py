@@ -41,16 +41,7 @@ def get_live_xauusd_spot():
             if price > 1000: return float(price)
     except: pass
 
-    # Source 2: TV Forex Scanner
-    try:
-        url = "https://scanner.tradingview.com/forex/scan"
-        res = requests.post(url, json=payload, headers=headers, timeout=5)
-        if res.status_code == 200:
-            price = res.json().get('data', [{}])[0].get('d', [0])[0]
-            if price > 1000: return float(price)
-    except: pass
-    
-    # Source 3: KuCoin PAXG (1:1 Physical Gold Peg)
+    # Source 2: KuCoin PAXG (1:1 Physical Gold Peg)
     try:
         url = "https://api.kucoin.com/api/v1/market/orderbook/level1?symbol=PAXG-USDT"
         res = requests.get(url, timeout=3)
@@ -83,13 +74,13 @@ capital = st.sidebar.number_input("Starting Capital ($)", min_value=1000.0, max_
 risk_pct = st.sidebar.slider("Risk Per Trade (%)", min_value=0.5, max_value=5.0, value=2.0, step=0.5)
 bt_window = st.sidebar.slider("Structural Swing Lookback", min_value=5, max_value=30, value=15)
 
-# --- BULLETPROOF HISTORICAL DATA FETCHER ---
-@st.cache_data(ttl=300) # 5-min cache prevents yfinance rate-limiting
-def fetch_market_data(anchor: float):
-    """Multi-tiered cascade to guarantee data fetching regardless of cloud blocks."""
+# --- STABLE HISTORICAL DATA FETCHER (NO SPREAD MATH) ---
+@st.cache_data(ttl=300) 
+def fetch_market_data():
+    """Fetches pure unshifted historical spot candles."""
     df_live, df_bt = pd.DataFrame(), pd.DataFrame()
     
-    # ATTEMPT 1: yfinance (Most robust if not spammed)
+    # ATTEMPT 1: yfinance
     try:
         df_live = yf.download("XAUUSD=X", period="14d", interval="15m", progress=False)
         df_bt = yf.download("XAUUSD=X", period="6mo", interval="1h", progress=False)
@@ -99,74 +90,53 @@ def fetch_market_data(anchor: float):
     except: pass
 
     # ATTEMPT 2: TradingView Python API
-    if df_live.empty or df_bt.empty:
+    if df_live is None or df_live.empty or df_bt is None or df_bt.empty:
         if tv is not None:
             try:
                 df_live = tv.get_hist(symbol='XAUUSD', exchange='FXCM', interval=Interval.in_15_minute, n_bars=1400)
                 df_bt = tv.get_hist(symbol='XAUUSD', exchange='FXCM', interval=Interval.in_1_hour, n_bars=4500)
             except: pass
 
-    # ATTEMPT 3: yfinance Futures (GC=F)
+    # ATTEMPT 3: KuCoin PAXG
     if df_live is None or df_live.empty or df_bt is None or df_bt.empty:
         try:
-            df_live = yf.download("GC=F", period="14d", interval="15m", progress=False)
-            df_bt = yf.download("GC=F", period="6mo", interval="1h", progress=False)
-            if not df_live.empty and isinstance(df_live.columns, pd.MultiIndex):
-                df_live.columns = df_live.columns.get_level_values(0)
-                df_bt.columns = df_bt.columns.get_level_values(0)
-        except: pass
-
-    # ATTEMPT 4: KuCoin PAXG (Unblockable US-friendly Crypto Fallback)
-    if df_live is None or df_live.empty or df_bt is None or df_bt.empty:
-        try:
-            # 15m structural data
             res_15 = requests.get("https://api.kucoin.com/api/v1/market/candles?type=15min&symbol=PAXG-USDT", timeout=5).json()
             d1 = pd.DataFrame(res_15['data'], columns=['time', 'open', 'close', 'high', 'low', 'v', 't'])
             d1['time'] = pd.to_datetime(d1['time'].astype(int), unit='s', utc=True)
             df_live = d1[['time', 'open', 'high', 'low', 'close']].set_index('time').astype(float).sort_index()
             
-            # 1h backtest data
             res_1h = requests.get("https://api.kucoin.com/api/v1/market/candles?type=1hour&symbol=PAXG-USDT", timeout=5).json()
             d2 = pd.DataFrame(res_1h['data'], columns=['time', 'open', 'close', 'high', 'low', 'v', 't'])
             d2['time'] = pd.to_datetime(d2['time'].astype(int), unit='s', utc=True)
             df_bt = d2[['time', 'open', 'high', 'low', 'close']].set_index('time').astype(float).sort_index()
         except: pass
             
-    # Universal Clean & Align Module
+    # Universal Clean (NO SPREAD SHIFTING)
     if df_live is not None and not df_live.empty and df_bt is not None and not df_bt.empty:
         for df in [df_live, df_bt]:
-            # Clean columns (Handles YF, TV, and Kucoin column naming variants)
             df.rename(columns=lambda x: x.capitalize() if isinstance(x, str) else x, inplace=True)
-            
-            # Clean timezone
             if df.index.tz is None:
                 df.index = df.index.tz_localize('UTC')
             else:
                 df.index = df.index.tz_convert('UTC')
-
-        # Spread Offset Math (Anchors whatever asset we pulled perfectly to the TV live spot price)
-        active_historical_bar = float(df_live['Close'].dropna().iloc[-1])
-        spread = active_historical_bar - anchor
-        for df in [df_live, df_bt]:
-            for col in ['Open', 'High', 'Low', 'Close']:
-                if col in df.columns:
-                    df[col] = df[col] - spread
-                    
         return df_live, df_bt
         
     return pd.DataFrame(), pd.DataFrame()
 
-# --- SMC STRUCTURAL LOGIC ---
+# --- SMC STRUCTURAL LOGIC (LOCKED TO CLOSED CANDLES) ---
 def analyze_smc_structure(df, window=12):
-    highs = argrelextrema(df['High'].values, np.greater, order=window)[0]
-    lows = argrelextrema(df['Low'].values, np.less, order=window)[0]
+    # CRITICAL FIX: Slicing out the active unclosed candle prevents the zones from repainting
+    closed_df = df.iloc[:-1]
+
+    highs = argrelextrema(closed_df['High'].values, np.greater, order=window)[0]
+    lows = argrelextrema(closed_df['Low'].values, np.less, order=window)[0]
     
-    recent_high = float(df['High'].iloc[highs[-1]]) if len(highs) > 0 else float(df['High'].max())
-    recent_low = float(df['Low'].iloc[lows[-1]]) if len(lows) > 0 else float(df['Low'].min())
+    recent_high = float(closed_df['High'].iloc[highs[-1]]) if len(highs) > 0 else float(closed_df['High'].max())
+    recent_low = float(closed_df['Low'].iloc[lows[-1]]) if len(lows) > 0 else float(closed_df['Low'].min())
     
     if recent_low >= recent_high:
-        recent_high = float(df['High'].max())
-        recent_low = float(df['Low'].min())
+        recent_high = float(closed_df['High'].max())
+        recent_low = float(closed_df['Low'].min())
         
     total_range = recent_high - recent_low
     equilibrium = recent_high - (total_range * 0.50)
@@ -175,11 +145,12 @@ def analyze_smc_structure(df, window=12):
     
     return recent_high, recent_low, equilibrium, golden_zone_low, golden_zone_high
 
-# --- BACKTESTING ENGINE (LONG & SHORT SUPPORT) ---
+# --- BACKTESTING ENGINE (BIDIRECTIONAL) ---
 def run_backtest(df, start_capital, risk, window):
     df = df.copy()
-    df['Swing_High'] = df['High'].rolling(window=window*2, center=True).max().ffill()
-    df['Swing_Low'] = df['Low'].rolling(window=window*2, center=True).min().ffill()
+    # CRITICAL FIX: center=False stops the backtest from looking into the future
+    df['Swing_High'] = df['High'].rolling(window=window*2, center=False).max().ffill()
+    df['Swing_Low'] = df['Low'].rolling(window=window*2, center=False).min().ffill()
     
     in_trade = False
     trade_type = None  
@@ -191,7 +162,7 @@ def run_backtest(df, start_capital, risk, window):
     dates = [df.index[0]]
     trades = []
     
-    for i in range(window, len(df)):
+    for i in range(window*2, len(df)):
         close = df['Close'].iloc[i]
         curr_high = df['High'].iloc[i]
         curr_low = df['Low'].iloc[i]
@@ -206,11 +177,8 @@ def run_backtest(df, start_capital, risk, window):
         total_range = high - low
         eq = high - (total_range * 0.50)
         
-        # Premium Supply (Short) Zone
         short_ote_low = high - (total_range * 0.382)
         short_ote_high = high - (total_range * 0.214)
-        
-        # Discount Demand (Long) Zone
         long_ote_high = low + (total_range * 0.382)
         long_ote_low = low + (total_range * 0.214)
         
@@ -273,16 +241,16 @@ def run_backtest(df, start_capital, risk, window):
     return trades, dates, equity_curve
 
 # --- RENDER DASHBOARD ---
-df_live, df_bt = fetch_market_data(live_spot)
+df_live, df_bt = fetch_market_data()
 
 if df_live is not None and not df_live.empty and df_bt is not None and not df_bt.empty:
     tab1, tab2 = st.tabs(["🔴 Live Market Execution", "📊 Historical Backtest Results"])
     
     with tab1:
         current_price = live_spot 
-        swing_high, swing_low, eq, gz_low, gz_high = analyze_smc_structure(df_live)
+        swing_high, swing_low, eq, gz_low, gz_high = analyze_smc_structure(df_live, window=bt_window)
         
-        st.subheader(f"Active Live Spot Price (TV): ${current_price:,.2f}")
+        st.subheader(f"Active Live Spot Price: ${current_price:,.2f}")
         
         col1, col2 = st.columns(2)
         with col1:
@@ -295,7 +263,10 @@ if df_live is not None and not df_live.empty and df_bt is not None and not df_bt
             st.markdown(f"**Market Valuation:** :{badge_color}[{status}]")
 
         with col2:
-            st.markdown("### SMC Execution Plan")
+            # Dynamically adjusts text for Long vs Short depending on location
+            action_text = "Short" if current_price > eq else "Long"
+            st.markdown(f"### SMC Execution Plan ({action_text}-Biased)")
+            
             if current_price > eq:
                 st.write(f"**Optimal Short Entry Zone:** ${gz_low:,.2f} – ${gz_high:,.2f}")
                 st.write(f"**Stop Loss:** ${swing_high + 2.50:,.2f}")
@@ -334,7 +305,7 @@ if df_live is not None and not df_live.empty and df_bt is not None and not df_bt
         st.pyplot(fig)
         
     with tab2:
-        st.subheader("Historical Backtest (1-Hour Structure)")
+        st.subheader("Historical Backtest Results")
         trades, bt_dates, equity_curve = run_backtest(df_bt, capital, risk_pct, bt_window)
         total_trades = len(trades)
         
@@ -369,7 +340,7 @@ if df_live is not None and not df_live.empty and df_bt is not None and not df_bt
             trade_df['Exit Date'] = trade_df['Exit Date'].dt.strftime('%b %d, %Y - %H:%M')
             trade_df['Entry Price'] = trade_df['Entry Price'].apply(lambda x: f"${x:,.2f}")
             trade_df['Stop Loss'] = trade_df['Stop Loss'].apply(lambda x: f"${x:,.2f}")
-            trade_df['Target (TP)'] = trade_df['Target (TP)'].apply(lambda x: f"${x:,.2f}")
+            trade_df['Target (TP)'] = trade_df['Target (TP)'] .apply(lambda x: f"${x:,.2f}")
             trade_df['Net P&L'] = trade_df['Net P&L'].apply(lambda x: f"${x:,.2f}")
             
             cols = ['Entry Date', 'Exit Date', 'Type', 'Result', 'Entry Price', 'Stop Loss', 'Target (TP)', 'Net P&L']
