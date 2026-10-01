@@ -9,11 +9,10 @@ from tvDatafeed import TvDatafeed, Interval
 import requests
 import logging
 
-# Silence TradingView login warnings
 logging.getLogger('tvDatafeed').setLevel(logging.ERROR)
 
-st.set_page_config(page_title="Multi-Timeframe SMC Engine", layout="wide")
-st.title("Smart Money Concepts (SMC) — 15M & 4H Live Multi-Timeframe Desk")
+st.set_page_config(page_title="4H SMC Swing Engine & 6M Backtest", layout="wide")
+st.title("Gold (XAUUSD) — 4-Hour SMC Swing Engine & 6-Month Backtest")
 
 # --- INITIALIZE TRADINGVIEW CONNECTION ---
 @st.cache_resource
@@ -54,30 +53,21 @@ def get_live_xauusd_spot():
 market_spot = get_live_xauusd_spot()
 
 # --- SIDEBAR CONTROLS ---
-st.sidebar.header("Live Feed Synchronization")
-manual_override = st.sidebar.checkbox("Override Live Feed (Manual Mode)", value=False)
+st.sidebar.header("Execution & Account Settings")
+live_spot = market_spot
+st.sidebar.success(f"Live Feed Synchronized\n\n**Current Spot: ${live_spot:,.2f}**")
 
-if manual_override:
-    live_spot = st.sidebar.number_input(
-        "Manual MT5 Spot Price (USD)",
-        min_value=1000.0, max_value=10000.0,
-        value=float(round(market_spot, 2)), step=0.10
-    )
-    st.sidebar.warning("Manual Override Active. Uncheck to resume live sync.")
-else:
-    live_spot = market_spot
-    st.sidebar.success(f"Live Sync Active\n\n**Current Spot: ${live_spot:,.2f}**")
-
-st.sidebar.header("SMC & Risk Parameters")
-capital = st.sidebar.number_input("Starting Capital ($)", min_value=1000.0, max_value=100000.0, value=15000.0, step=1000.0)
+capital = st.sidebar.number_input("Account Balance ($)", min_value=1000.0, max_value=100000.0, value=15000.0, step=1000.0)
 risk_pct = st.sidebar.slider("Risk Per Trade (%)", min_value=0.5, max_value=5.0, value=2.0, step=0.5)
-bt_window_15m = st.sidebar.slider("15M Swing Lookback", min_value=5, max_value=30, value=12)
-bt_window_4h = st.sidebar.slider("4H Swing Lookback", min_value=3, max_value=20, value=6)
 
-# --- STABLE HISTORICAL DATA FETCHER (15M, 1H, 4H) ---
+st.sidebar.header("4-Hour Swing Parameters")
+bt_window_4h = st.sidebar.slider("4H Swing Lookback (Bars)", min_value=3, max_value=20, value=6, help="Lookback window for major 4H highs and lows.")
+h4_sl_buffer = st.sidebar.slider("4H Stop Loss Buffer ($)", min_value=2.0, max_value=15.0, value=6.50, step=0.5, help="Buffer added beyond the 4H swing high/low to absorb wicks.")
+
+# --- 6-MONTH DATA PIPELINE (15M, 1H, 4H) ---
 @st.cache_data(ttl=300)
 def fetch_market_data():
-    """Fetches pure unshifted spot candles and resamples to 4H."""
+    """Pulls 6 months of hourly data to construct institutional 4-Hour candles."""
     df_15m, df_1h = pd.DataFrame(), pd.DataFrame()
 
     # 1. TradingView API
@@ -91,29 +81,39 @@ def fetch_market_data():
                     break
             except Exception: continue
 
-    # 2. Bitfinex Fallback
-    if df_15m is None or df_15m.empty or df_1h is None or df_1h.empty:
+    # 2. yfinance 6-Month Fallback
+    if df_1h is None or df_1h.empty:
         try:
-            r15 = requests.get("https://api-pub.bitfinex.com/v2/candles/trade:15m:tXAUUSD/hist?limit=1500", timeout=5).json()
-            d15 = pd.DataFrame(r15, columns=['time', 'open', 'close', 'high', 'low', 'volume'])
-            d15['time'] = pd.to_datetime(d15['time'], unit='ms', utc=True)
-            df_15m = d15[['time', 'open', 'high', 'low', 'close']].set_index('time').astype(float).sort_index()
+            df_1h = yf.download("XAUUSD=X", period="6mo", interval="1h", progress=False)
+            df_15m = yf.download("XAUUSD=X", period="14d", interval="15m", progress=False)
+            if isinstance(df_1h.columns, pd.MultiIndex): df_1h.columns = df_1h.columns.get_level_values(0)
+            if isinstance(df_15m.columns, pd.MultiIndex): df_15m.columns = df_15m.columns.get_level_values(0)
+        except Exception: pass
 
+    # 3. Bitfinex Fallback
+    if df_1h is None or df_1h.empty:
+        try:
             r1h = requests.get("https://api-pub.bitfinex.com/v2/candles/trade:1h:tXAUUSD/hist?limit=4500", timeout=5).json()
             d1h = pd.DataFrame(r1h, columns=['time', 'open', 'close', 'high', 'low', 'volume'])
             d1h['time'] = pd.to_datetime(d1h['time'], unit='ms', utc=True)
             df_1h = d1h[['time', 'open', 'high', 'low', 'close']].set_index('time').astype(float).sort_index()
+
+            r15 = requests.get("https://api-pub.bitfinex.com/v2/candles/trade:15m:tXAUUSD/hist?limit=1500", timeout=5).json()
+            d15 = pd.DataFrame(r15, columns=['time', 'open', 'close', 'high', 'low', 'volume'])
+            d15['time'] = pd.to_datetime(d15['time'], unit='ms', utc=True)
+            df_15m = d15[['time', 'open', 'high', 'low', 'close']].set_index('time').astype(float).sort_index()
         except Exception: pass
 
-    # Clean data and synthesize 4H resampled candles
-    if df_15m is not None and not df_15m.empty and df_1h is not None and not df_1h.empty:
+    if df_1h is not None and not df_1h.empty:
         for df in [df_15m, df_1h]:
-            df.rename(columns=lambda x: x.capitalize() if isinstance(x, str) else x, inplace=True)
-            if df.index.tz is None:
-                df.index = df.index.tz_localize('UTC')
-            else:
-                df.index = df.index.tz_convert('UTC')
+            if not df.empty:
+                df.rename(columns=lambda x: x.capitalize() if isinstance(x, str) else x, inplace=True)
+                if df.index.tz is None:
+                    df.index = df.index.tz_localize('UTC')
+                else:
+                    df.index = df.index.tz_convert('UTC')
 
+        # Resample clean 1H candles into 4H candles across the entire 6-month period
         df_4h = df_1h.resample('4h').agg({
             'Open': 'first',
             'High': 'max',
@@ -125,8 +125,8 @@ def fetch_market_data():
         
     return pd.DataFrame(), pd.DataFrame(), pd.DataFrame()
 
-# --- SMC STRUCTURAL LOGIC (LOCKED TO CLOSED CANDLES) ---
-def analyze_smc_structure(df, window=12):
+# --- SMC STRUCTURAL LOGIC ---
+def analyze_smc_structure(df, window=6):
     closed_df = df.iloc[:-1]
     
     highs = argrelextrema(closed_df['High'].values, np.greater, order=window)[0]
@@ -142,21 +142,22 @@ def analyze_smc_structure(df, window=12):
     total_range = recent_high - recent_low
     equilibrium = recent_high - (total_range * 0.50)
     
-    # Premium OTE (Supply) Zone: 61.8% to 78.6% retracement
+    # Premium OTE (Supply) Zone: 61.8% to 78.6%
     short_ote_low = recent_high - (total_range * 0.382)
     short_ote_high = recent_high - (total_range * 0.214)
     
-    # Discount OTE (Demand) Zone: 61.8% to 78.6% retracement
+    # Discount OTE (Demand) Zone: 61.8% to 78.6%
     long_ote_low = recent_low + (total_range * 0.214)
     long_ote_high = recent_low + (total_range * 0.382)
     
     return recent_high, recent_low, equilibrium, short_ote_low, short_ote_high, long_ote_low, long_ote_high
 
-# --- 1H BACKTESTING ENGINE ---
-def run_backtest(df, start_capital, risk, window):
+# --- 4-HOUR BIDIRECTIONAL BACKTEST ENGINE ---
+def run_4h_backtest(df, start_capital, risk, window, sl_buffer):
     df = df.copy()
-    df['Swing_High'] = df['High'].rolling(window=window*2, center=False).max().ffill()
-    df['Swing_Low'] = df['Low'].rolling(window=window*2, center=False).min().ffill()
+    # Dynamic swing calculation without lookahead bias
+    df['Swing_High'] = df['High'].rolling(window=window*2, center=False).max().shift(1)
+    df['Swing_Low'] = df['Low'].rolling(window=window*2, center=False).min().shift(1)
     
     in_trade = False
     trade_type = None
@@ -168,7 +169,7 @@ def run_backtest(df, start_capital, risk, window):
     dates = [df.index[0]]
     trades = []
     
-    for i in range(window*2, len(df)):
+    for i in range(window*2 + 1, len(df)):
         close = df['Close'].iloc[i]
         curr_high = df['High'].iloc[i]
         curr_low = df['Low'].iloc[i]
@@ -188,25 +189,27 @@ def run_backtest(df, start_capital, risk, window):
         long_ote_high = low + (total_range * 0.382)
         
         if not in_trade:
-            # Bearish OTE trigger
+            # 1. Bearish OTE Retracement (Sell in Premium)
             if (short_ote_low <= close <= short_ote_high) and close > eq:
                 in_trade = True
                 trade_type = 'Short'
                 entry_price = close
-                stop_loss = high + 2.50
-                take_profit = low
+                stop_loss = high + sl_buffer
+                take_profit = low  # External SSL target
                 entry_date = date
-            # Bullish OTE trigger
+                
+            # 2. Bullish OTE Retracement (Buy in Discount)
             elif (long_ote_low <= close <= long_ote_high) and close < eq:
                 in_trade = True
                 trade_type = 'Long'
                 entry_price = close
-                stop_loss = low - 2.50
-                take_profit = high
+                stop_loss = low - sl_buffer
+                take_profit = high  # External BSL target
                 entry_date = date
                 
         elif in_trade:
             risk_amt = equity * (risk / 100)
+            
             if trade_type == 'Short':
                 if curr_high >= stop_loss:  
                     equity -= risk_amt
@@ -218,6 +221,7 @@ def run_backtest(df, start_capital, risk, window):
                     equity += win_amt
                     trades.append({'Entry Date': entry_date, 'Exit Date': date, 'Type': 'Short', 'Result': 'Win', 'Entry Price': entry_price, 'Stop Loss': stop_loss, 'Target (TP)': take_profit, 'Net P&L': win_amt})
                     in_trade = False
+                    
             elif trade_type == 'Long':
                 if curr_low <= stop_loss:  
                     equity -= risk_amt
@@ -243,151 +247,60 @@ def run_backtest(df, start_capital, risk, window):
 # --- RENDER DASHBOARD ---
 df_15m, df_1h, df_4h = fetch_market_data()
 
-if not df_15m.empty and not df_1h.empty and not df_4h.empty:
-    tab_exec, tab_backtest = st.tabs(["🔴 Live Multi-Timeframe SMC Desk", "📊 Historical Backtest Results"])
+if not df_4h.empty:
+    current_price = live_spot
     
-    with tab_exec:
-        current_price = live_spot 
-        st.subheader(f"Active Live Spot Price: ${current_price:,.2f}")
-        
-        # Calculate Structures
-        h15, l15, eq15, s_ote_low15, s_ote_high15, l_ote_low15, l_ote_high15 = analyze_smc_structure(df_15m, window=bt_window_15m)
-        h4, l4, eq4, s_ote_low4, s_ote_high4, l_ote_low4, l_ote_high4 = analyze_smc_structure(df_4h, window=bt_window_4h)
-        
-        # Multi-timeframe sub-tabs
-        subtab_4h, subtab_15m = st.tabs(["🏛️ 4-Hour Macro Swing SMC", "⚡ 15-Minute Intraday SMC"])
-        
-        # ==================== 4-HOUR SMC SECTION ====================
-        with subtab_4h:
-            col1, col2 = st.columns(2)
-            is_4h_premium = current_price > eq4
-            val_status_4h = "PREMIUM (Sell Allowed)" if is_4h_premium else "DISCOUNT (Buy Allowed)"
-            val_color_4h = "red" if is_4h_premium else "green"
-            
-            with col1:
-                st.markdown("### 4-Hour Institutional Dealing Range")
-                st.write(f"**Swing High (BSL):** ${h4:,.2f}")
-                st.write(f"**Equilibrium (50%):** ${eq4:,.2f}")
-                st.write(f"**Swing Low (SSL):** ${l4:,.2f}")
-                st.markdown(f"**Market Valuation:** :{val_color_4h}[{val_status_4h}]")
-                
-            with col2:
-                action_4h = "Short" if is_4h_premium else "Long"
-                st.markdown(f"### 4-Hour Macro Execution Plan ({action_4h}-Biased)")
-                if is_4h_premium:
-                    st.write(f"**Optimal Short Entry Zone (Supply OTE):** ${s_ote_low4:,.2f} – ${s_ote_high4:,.2f}")
-                    st.write(f"**Stop Loss:** ${h4 + 5.00:,.2f}")
-                    st.write(f"**Take Profit:** ${l4:,.2f}")
-                else:
-                    st.write(f"**Optimal Long Entry Zone (Demand OTE):** ${l_ote_low4:,.2f} – ${l_ote_high4:,.2f}")
-                    st.write(f"**Stop Loss:** ${l4 - 5.00:,.2f}")
-                    st.write(f"**Take Profit:** ${h4:,.2f}")
-                    
-            st.divider()
-            st.subheader("4-Hour SMC Market Structure Chart")
-            
-            df_chart_4h = df_4h.tail(120)
-            fig_4h, ax_4h = plt.subplots(figsize=(14, 6))
-            ax_4h.plot(df_chart_4h.index, df_chart_4h['Close'], color='black', linewidth=1.5, label="H4 Spot Close")
-            
-            # Premium & Discount shading
-            ax_4h.axhspan(eq4, h4, color='red', alpha=0.06, label="H4 Premium Zone")
-            ax_4h.axhspan(l4, eq4, color='green', alpha=0.06, label="H4 Discount Zone")
-            
-            # OTE Zones
-            ax_4h.axhspan(s_ote_low4, s_ote_high4, color='darkred', alpha=0.25, label="H4 OTE Supply (Short) Zone")
-            ax_4h.axhspan(l_ote_low4, l_ote_high4, color='darkgreen', alpha=0.25, label="H4 OTE Demand (Long) Zone")
-            
-            # Structural Lines
-            ax_4h.axhline(h4, color='red', linestyle='--', linewidth=1.8, label=f"H4 BSL (${h4:,.2f})")
-            ax_4h.axhline(l4, color='green', linestyle='--', linewidth=1.8, label=f"H4 SSL (${l4:,.2f})")
-            ax_4h.axhline(eq4, color='blue', linestyle=':', linewidth=1.4, label=f"H4 Equilibrium (${eq4:,.2f})")
-            
-            ax_4h.xaxis.set_major_formatter(mdates.DateFormatter('%b %d\n%H:%M UTC'))
-            ax_4h.set_ylabel('Spot Price (USD)')
-            ax_4h.legend(loc='upper right', bbox_to_anchor=(1.25, 1))
-            ax_4h.grid(alpha=0.25)
-            st.pyplot(fig_4h)
-
-        # ==================== 15-MINUTE SMC SECTION ====================
-        with subtab_15m:
-            col1, col2 = st.columns(2)
-            is_15m_premium = current_price > eq15
-            val_status_15m = "PREMIUM (Sell Allowed)" if is_15m_premium else "DISCOUNT (Buy Allowed)"
-            val_color_15m = "red" if is_15m_premium else "green"
-            
-            with col1:
-                st.markdown("### 15-Minute Institutional Dealing Range")
-                st.write(f"**Swing High (BSL):** ${h15:,.2f}")
-                st.write(f"**Equilibrium (50%):** ${eq15:,.2f}")
-                st.write(f"**Swing Low (SSL):** ${l15:,.2f}")
-                st.markdown(f"**Market Valuation:** :{val_color_15m}[{val_status_15m}]")
-                
-            with col2:
-                action_15m = "Short" if is_15m_premium else "Long"
-                st.markdown(f"### 15-Minute Intraday Execution Plan ({action_15m}-Biased)")
-                if is_15m_premium:
-                    st.write(f"**Optimal Short Entry Zone (Supply OTE):** ${s_ote_low15:,.2f} – ${s_ote_high15:,.2f}")
-                    st.write(f"**Stop Loss:** ${h15 + 2.50:,.2f}")
-                    st.write(f"**Take Profit:** ${l15:,.2f}")
-                else:
-                    st.write(f"**Optimal Long Entry Zone (Demand OTE):** ${l_ote_low15:,.2f} – ${l_ote_high15:,.2f}")
-                    st.write(f"**Stop Loss:** ${l15 - 2.50:,.2f}")
-                    st.write(f"**Take Profit:** ${h15:,.2f}")
-                    
-            st.divider()
-            st.subheader("15-Minute SMC Market Structure Chart")
-            
-            df_chart_15m = df_15m.tail(150)
-            fig_15m, ax_15m = plt.subplots(figsize=(14, 6))
-            ax_15m.plot(df_chart_15m.index, df_chart_15m['Close'], color='black', linewidth=1.2, label="15m Spot Price")
-            
-            ax_15m.axhspan(eq15, h15, color='red', alpha=0.06, label="15m Premium Zone")
-            ax_15m.axhspan(l15, eq15, color='green', alpha=0.06, label="15m Discount Zone")
-            
-            ax_15m.axhspan(s_ote_low15, s_ote_high15, color='darkred', alpha=0.25, label="15m OTE Supply Zone")
-            ax_15m.axhspan(l_ote_low15, l_ote_high15, color='darkgreen', alpha=0.25, label="15m OTE Demand Zone")
-            
-            ax_15m.axhline(h15, color='red', linestyle='--', linewidth=1.8, label=f"15m BSL (${h15:,.2f})")
-            ax_15m.axhline(l15, color='green', linestyle='--', linewidth=1.8, label=f"15m SSL (${l15:,.2f})")
-            ax_15m.axhline(eq15, color='blue', linestyle=':', linewidth=1.4, label=f"15m Equilibrium (${eq15:,.2f})")
-            
-            ax_15m.xaxis.set_major_formatter(mdates.DateFormatter('%b %d\n%H:%M UTC'))
-            ax_15m.set_ylabel('Spot Price (USD)')
-            ax_15m.legend(loc='upper right', bbox_to_anchor=(1.25, 1))
-            ax_15m.grid(alpha=0.25)
-            st.pyplot(fig_15m)
-
-    # ==================== BACKTEST SECTION ====================
+    # Analyze active 4H structure
+    h4, l4, eq4, s_ote_low4, s_ote_high4, l_ote_low4, l_ote_high4 = analyze_smc_structure(df_4h, window=bt_window_4h)
+    
+    # Run 6-Month 4H Backtest
+    trades_4h, dates_4h, equity_4h = run_4h_backtest(df_4h, capital, risk_pct, bt_window_4h, h4_sl_buffer)
+    total_trades_4h = len(trades_4h)
+    
+    tab_backtest, tab_live = st.tabs(["📊 4-Hour Historical Backtest (6 Months)", "🏛️ 4-Hour Live SMC Dealing Desk"])
+    
+    # ==================== TAB 1: 4H 6-MONTH BACKTEST ====================
     with tab_backtest:
-        st.subheader("Historical Backtest Results")
-        trades, bt_dates, equity_curve = run_backtest(df_1h, capital, risk_pct, bt_window_15m)
-        total_trades = len(trades)
+        st.subheader("6-Month 4-Hour Swing Strategy Performance")
         
-        if total_trades > 0:
-            wins = len([t for t in trades if t['Result'] == 'Win'])
-            win_rate = (wins / total_trades) * 100
-            total_net = equity_curve[-1] - capital
+        if total_trades_4h > 0:
+            wins = len([t for t in trades_4h if t['Result'] == 'Win'])
+            losses = total_trades_4h - wins
+            win_rate = (wins / total_trades_4h) * 100
+            total_net = equity_4h[-1] - capital
+            ret_pct = (total_net / capital) * 100
             
+            # Profit Factor & Expectancy
+            total_gross_win = sum([t['Net P&L'] for t in trades_4h if t['Result'] == 'Win'])
+            total_gross_loss = abs(sum([t['Net P&L'] for t in trades_4h if t['Result'] == 'Loss']))
+            profit_factor = (total_gross_win / total_gross_loss) if total_gross_loss > 0 else 0.0
+
             c1, c2, c3, c4 = st.columns(4)
-            c1.metric("Total Executed Trades", total_trades)
-            c2.metric("System Win Rate", f"{win_rate:.1f}%")
-            c3.metric("Net Profit (USD)", f"${total_net:,.2f}")
-            c4.metric("Ending Account Balance", f"${equity_curve[-1]:,.2f}")
+            c1.metric("Total 4H Setups Triggered", total_trades_4h, f"Wins: {wins} | Losses: {losses}")
+            c2.metric("4H System Win Rate", f"{win_rate:.1f}%")
+            
+            color_metric = f":green[${total_net:,.2f}]" if total_net > 0 else f":red[${total_net:,.2f}]"
+            c3.markdown(f"**Net Profit (6 Months)**\n### {color_metric}")
+            c4.metric("Profit Factor", f"{profit_factor:.2f}", f"Return: {ret_pct:.1f}%")
             
             st.divider()
-            fig2, ax2 = plt.subplots(figsize=(14, 5))
-            ax2.plot(bt_dates, equity_curve, color='teal', linewidth=2, label="Account Equity")
-            ax2.axhline(capital, color='black', linestyle='--', linewidth=1, label="Starting Capital")
-            ax2.xaxis.set_major_formatter(mdates.DateFormatter('%b %Y'))
-            ax2.set_ylabel('Balance (USD)')
-            ax2.legend()
-            ax2.grid(alpha=0.25)
-            st.pyplot(fig2)
+            
+            # 6-Month Equity Curve
+            st.subheader("Portfolio Equity Growth (6-Month Swing Curve)")
+            fig_eq, ax_eq = plt.subplots(figsize=(14, 5))
+            ax_eq.plot(dates_4h, equity_4h, color='teal', linewidth=2, label="Account Equity")
+            ax_eq.axhline(capital, color='black', linestyle='--', linewidth=1, label="Initial Capital")
+            ax_eq.xaxis.set_major_formatter(mdates.DateFormatter('%b %Y'))
+            ax_eq.set_ylabel('Balance (USD)')
+            ax_eq.legend(loc='upper left')
+            ax_eq.grid(alpha=0.25)
+            st.pyplot(fig_eq)
             
             st.divider()
-            st.subheader("📝 Detailed Trade Ledger")
-            trade_df = pd.DataFrame(trades)
+            
+            # 4H Trade Ledger
+            st.subheader("📝 4-Hour Executed Trade Ledger (Past 6 Months)")
+            trade_df = pd.DataFrame(trades_4h)
             trade_df['Entry Date'] = trade_df['Entry Date'].dt.strftime('%b %d, %Y - %H:%M')
             trade_df['Exit Date'] = trade_df['Exit Date'].dt.strftime('%b %d, %Y - %H:%M')
             trade_df['Entry Price'] = trade_df['Entry Price'].apply(lambda x: f"${x:,.2f}")
@@ -395,8 +308,61 @@ if not df_15m.empty and not df_1h.empty and not df_4h.empty:
             trade_df['Target (TP)'] = trade_df['Target (TP)'].apply(lambda x: f"${x:,.2f}")
             trade_df['Net P&L'] = trade_df['Net P&L'].apply(lambda x: f"${x:,.2f}")
             
-            st.dataframe(trade_df, use_container_width=True, hide_index=True)
+            cols = ['Entry Date', 'Exit Date', 'Type', 'Result', 'Entry Price', 'Stop Loss', 'Target (TP)', 'Net P&L']
+            st.dataframe(trade_df[cols].iloc[::-1], use_container_width=True, hide_index=True)
+            
         else:
-            st.warning("No trades triggered under current parameters.")
+            st.warning("No 4-Hour swing trades triggered under current parameter configuration. Adjust lookback window in the sidebar.")
+            
+    # ==================== TAB 2: LIVE 4H DEALING DESK ====================
+    with tab_live:
+        st.subheader(f"Current Live Spot Price: ${current_price:,.2f}")
+        
+        is_4h_premium = current_price > eq4
+        val_status_4h = "PREMIUM (Sell Allowed)" if is_4h_premium else "DISCOUNT (Buy Allowed)"
+        val_color_4h = "red" if is_4h_premium else "green"
+        action_4h = "Short" if is_4h_premium else "Long"
+        
+        col1, col2 = st.columns(2)
+        with col1:
+            st.markdown("### 4-Hour Dealing Range")
+            st.write(f"**Swing High (BSL):** ${h4:,.2f}")
+            st.write(f"**Equilibrium (50%):** ${eq4:,.2f}")
+            st.write(f"**Swing Low (SSL):** ${l4:,.2f}")
+            st.markdown(f"**Market Valuation:** :{val_color_4h}[{val_status_4h}]")
+            
+        with col2:
+            st.markdown(f"### Active Setup ({action_4h}-Biased)")
+            if is_4h_premium:
+                st.write(f"**Optimal Short Entry Zone (Supply OTE):** ${s_ote_low4:,.2f} – ${s_ote_high4:,.2f}")
+                st.write(f"**Stop Loss:** ${h4 + h4_sl_buffer:,.2f}")
+                st.write(f"**Target (Take Profit):** ${l4:,.2f}")
+            else:
+                st.write(f"**Optimal Long Entry Zone (Demand OTE):** ${l_ote_low4:,.2f} – ${l_ote_high4:,.2f}")
+                st.write(f"**Stop Loss:** ${l4 - h4_sl_buffer:,.2f}")
+                st.write(f"**Target (Take Profit):** ${h4:,.2f}")
+                
+        st.divider()
+        st.subheader("4-Hour SMC Institutional Chart")
+        
+        df_chart_4h = df_4h.tail(120)
+        fig_4h, ax_4h = plt.subplots(figsize=(14, 6))
+        ax_4h.plot(df_chart_4h.index, df_chart_4h['Close'], color='black', linewidth=1.5, label="H4 Spot Close")
+        
+        ax_4h.axhspan(eq4, h4, color='red', alpha=0.06, label="H4 Premium Zone")
+        ax_4h.axhspan(l4, eq4, color='green', alpha=0.06, label="H4 Discount Zone")
+        
+        ax_4h.axhspan(s_ote_low4, s_ote_high4, color='darkred', alpha=0.25, label="H4 OTE Supply Zone")
+        ax_4h.axhspan(l_ote_low4, l_ote_high4, color='darkgreen', alpha=0.25, label="H4 OTE Demand Zone")
+        
+        ax_4h.axhline(h4, color='red', linestyle='--', linewidth=1.8, label=f"H4 BSL (${h4:,.2f})")
+        ax_4h.axhline(l4, color='green', linestyle='--', linewidth=1.8, label=f"H4 SSL (${l4:,.2f})")
+        ax_4h.axhline(eq4, color='blue', linestyle=':', linewidth=1.4, label=f"H4 Equilibrium (${eq4:,.2f})")
+        
+        ax_4h.xaxis.set_major_formatter(mdates.DateFormatter('%b %d\n%H:%M UTC'))
+        ax_4h.set_ylabel('Spot Price (USD)')
+        ax_4h.legend(loc='upper right', bbox_to_anchor=(1.25, 1))
+        ax_4h.grid(alpha=0.25)
+        st.pyplot(fig_4h)
 else:
-    st.error("All data feeds are currently unreachable. Please verify network connection or wait for IP unblock.")
+    st.error("Market data feeds are currently unreachable. Verify network connection or wait for IP unblock.")
