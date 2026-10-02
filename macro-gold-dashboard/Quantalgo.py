@@ -94,7 +94,7 @@ def apply_adaptive_filters(df):
     loss = (-delta.where(delta < 0, 0)).rolling(14).mean()
     df['RSI'] = 100 - (100 / (1 + (gain / loss)))
     df['Vol_SMA'] = df['Volume'].rolling(20).mean()
-    df['Vol_Spike'] = df['Volume'] > (df['Vol_SMA'] * 2.0) # Updated threshold to 2.0
+    df['Vol_Spike'] = df['Volume'] > (df['Vol_SMA'] * 2.0)
     return df
 
 # --- 6-MONTH BACKTEST ENGINE ---
@@ -127,7 +127,7 @@ def run_quantum_backtest(df_1h, capital=10000, risk_pct=2.0):
                 in_trade = True
                 t_type = 'BUY'
                 entry_p = c['Close']
-                sl_p = c['Swing_Low'] - 6.50 # Widened stop buffer
+                sl_p = c['Swing_Low'] - 6.50
                 tp_p = c['Swing_High']
                 e_date = date
                 
@@ -136,7 +136,7 @@ def run_quantum_backtest(df_1h, capital=10000, risk_pct=2.0):
                 in_trade = True
                 t_type = 'SELL'
                 entry_p = c['Close']
-                sl_p = c['Swing_High'] + 6.50 # Widened stop buffer
+                sl_p = c['Swing_High'] + 6.50
                 tp_p = c['Swing_Low']
                 e_date = date
                 
@@ -205,25 +205,29 @@ with tab_live:
     st.divider()
     st.markdown("### 📝 Live Order Ticket")
     
-    if signal == "BUY (Long)":
+    # Calculate Live Stops and Targets based on bias, regardless of active signal
+    if mtf_bias == "BULLISH":
         live_sl = ssl - 6.50
         live_tp = bsl
-    elif signal == "SELL (Short)":
+        direction_text = "Potential Long"
+    elif mtf_bias == "BEARISH":
         live_sl = bsl + 6.50
         live_tp = ssl
+        direction_text = "Potential Short"
     else:
-        live_sl = 0.00
-        live_tp = 0.00
+        live_sl = ssl - 6.50  # Default to nearest support
+        live_tp = bsl         # Default to nearest resistance
+        direction_text = "Range Bound"
         
     t1, t2, t3 = st.columns(3)
-    t1.metric("Target (Take Profit)", f"${live_tp:,.2f}" if live_tp else "N/A")
-    t2.metric("Stop Loss", f"${live_sl:,.2f}" if live_sl else "N/A")
+    t1.metric(f"Target (Take Profit - {direction_text})", f"${live_tp:,.2f}")
+    t2.metric(f"Stop Loss ({direction_text})", f"${live_sl:,.2f}")
     
     risk_points = abs(live_spot - live_sl) if live_sl else 0
     reward_points = abs(live_tp - live_spot) if live_tp else 0
     rr_ratio = reward_points / risk_points if risk_points > 0 else 0
     
-    t3.metric("Risk:Reward Ratio", f"{rr_ratio:.2f} R" if live_sl else "N/A")
+    t3.metric("Projected Risk:Reward", f"{rr_ratio:.2f} R")
 
     st.divider()
     st.markdown("### 🔍 5-Stage Validation Pipeline Status")
