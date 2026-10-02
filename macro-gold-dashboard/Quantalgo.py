@@ -94,7 +94,7 @@ def apply_adaptive_filters(df):
     loss = (-delta.where(delta < 0, 0)).rolling(14).mean()
     df['RSI'] = 100 - (100 / (1 + (gain / loss)))
     df['Vol_SMA'] = df['Volume'].rolling(20).mean()
-    df['Vol_Spike'] = df['Volume'] > (df['Vol_SMA'] * 2.0)
+    df['Vol_Spike'] = df['Volume'] > (df['Vol_SMA'] * 1.65)
     return df
 
 # --- 6-MONTH BACKTEST ENGINE ---
