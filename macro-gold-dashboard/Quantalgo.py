@@ -58,10 +58,12 @@ def fetch_mtf_data():
         except Exception:
             df_15m = df_1h.tail(1000)
 
-    # Standardize Timezones
+    # Standardize Timezones to Indian Standard Time (IST)
     for df in [df_15m, df_1h, df_4h]:
-        if df.index.tz is None: df.index = df.index.tz_localize('UTC')
-        else: df.index = df.index.tz_convert('UTC')
+        if df.index.tz is None: 
+            df.index = df.index.tz_localize('UTC').tz_convert('Asia/Kolkata')
+        else: 
+            df.index = df.index.tz_convert('Asia/Kolkata')
 
     return df_15m, df_1h, df_4h
 
@@ -94,7 +96,7 @@ def apply_adaptive_filters(df):
     loss = (-delta.where(delta < 0, 0)).rolling(14).mean()
     df['RSI'] = 100 - (100 / (1 + (gain / loss)))
     df['Vol_SMA'] = df['Volume'].rolling(20).mean()
-    df['Vol_Spike'] = df['Volume'] > (df['Vol_SMA'] * 1.50)
+    df['Vol_Spike'] = df['Volume'] > (df['Vol_SMA'] * 2.0)
     return df
 
 # --- 6-MONTH BACKTEST ENGINE ---
@@ -257,7 +259,7 @@ with tab_live:
     spike_idx = df_plot[df_plot['Vol_Spike']].index
     ax.scatter(spike_idx, df_plot.loc[spike_idx, 'Close'], color='purple', marker='^', s=100, label="Vol Anomaly")
     
-    ax.xaxis.set_major_formatter(mdates.DateFormatter('%b %d - %H:%M'))
+    ax.xaxis.set_major_formatter(mdates.DateFormatter('%b %d - %H:%M\nIST'))
     ax.legend(loc='upper left', bbox_to_anchor=(1.01, 1))
     st.pyplot(fig)
 
@@ -284,7 +286,7 @@ with tab_backtest:
         m4.metric("Ending Account Equity", f"${equity[-1]:,.2f}")
         
         st.divider()
-        st.subheader("Historical Trade Ledger (Entry, Stop Loss, Target TP)")
+        st.subheader("Historical Trade Ledger (Entry, Stop Loss, Target TP - IST Timezone)")
         
         df_trades = pd.DataFrame(trades)
         df_trades['Entry Date'] = df_trades['Entry Date'].dt.strftime('%Y-%m-%d %H:%M')
