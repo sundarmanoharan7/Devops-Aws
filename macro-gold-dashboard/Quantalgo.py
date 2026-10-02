@@ -10,28 +10,54 @@ import requests
 st.set_page_config(page_title="Quantum Algo | XAUUSD Engine & Backtest", layout="wide")
 st.title("Gold (XAUUSD) — 5-Stage Quantum Algo & 6-Month Backtest")
 
-# --- STAGE 00: REAL-TIME SPOT TICKER ---
+# --- STAGE 00: REAL-TIME SPOT TICKER (SYNCHRONIZED WITH TRADINGVIEW) ---
+@st.cache_data(ttl=5)
 def get_live_spot(df_fallback):
-    """Fetches true real-time ticking spot price to match TradingView."""
-    try:
-        # Priority 1: Yahoo Fast Quote (Bypasses historical download limits)
-        price = yf.Ticker("XAUUSD=X").fast_info.last_price
-        if price > 1000: return price
-    except Exception: pass
+    """Pings TradingView's FXCM CFD scanner directly to match chart ticks in real time."""
+    headers = {
+        'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36',
+        'Origin': 'https://www.tradingview.com',
+        'Referer': 'https://www.tradingview.com/'
+    }
     
+    # Priority 1: Direct TradingView FXCM / OANDA Live Scanner
     try:
-        # Priority 2: MEXC PAXG (Highly liquid 1:1 spot proxy, no rate limits)
+        url = "https://scanner.tradingview.com/cfd/scan"
+        payload = {
+            "symbols": {"tickers": ["FXCM:XAUUSD", "OANDA:XAUUSD"]},
+            "columns": ["close", "bid", "ask"]
+        }
+        res = requests.post(url, json=payload, headers=headers, timeout=3)
+        if res.status_code == 200:
+            data = res.json().get('data', [])
+            if data and len(data) > 0:
+                tv_price = data[0].get('d', [0])[0]
+                if tv_price and float(tv_price) > 1000:
+                    return float(tv_price)
+    except Exception: pass
+
+    # Priority 2: KuCoin PAXG/USDT Raw Order Book (Ticking spot proxy)
+    try:
+        res = requests.get("https://api.kucoin.com/api/v1/market/orderbook/level1?symbol=PAXG-USDT", timeout=2).json()
+        price = res.get('data', {}).get('price')
+        if price and float(price) > 1000:
+            return float(price)
+    except Exception: pass
+
+    # Priority 3: MEXC Live Ticker
+    try:
         res = requests.get("https://api.mexc.com/api/v3/ticker/price?symbol=PAXGUSDT", timeout=2).json()
-        if float(res['price']) > 1000: return float(res['price'])
+        if float(res['price']) > 1000:
+            return float(res['price'])
     except Exception: pass
-    
-    # Priority 3: Fallback to the latest closed candle in the dataframe
-    return df_fallback['Close'].iloc[-1]
+
+    # Priority 4: Closed candle fallback
+    return float(df_fallback['Close'].iloc[-1])
 
 # --- STAGE 01: BULLETPROOF MARKET DATA INGESTION ---
 @st.cache_data(ttl=60)
 def fetch_mtf_data():
-    """Ingests data strictly from reliable APIs mapping directly to XAUUSD Spot."""
+    """Ingests data with isolated timeframes to bypass 720-candle Kraken limits."""
     df_15m, df_1h, df_4h = pd.DataFrame(), pd.DataFrame(), pd.DataFrame()
     
     session = requests.Session()
@@ -48,16 +74,6 @@ def fetch_mtf_data():
             df_1h = d_1h[['Open', 'High', 'Low', 'Close', 'Volume']].dropna()
     except Exception: pass
 
-    # 2. Fetch 14-Day 15m Data (Independent)
-    try:
-        d_15 = yf.download(target_ticker, period="14d", interval="15m", progress=False, session=session)
-        if not d_15.empty:
-            if isinstance(d_15.columns, pd.MultiIndex): d_15.columns = d_15.columns.get_level_values(0)
-            df_15m = d_15[['Open', 'High', 'Low', 'Close', 'Volume']].dropna()
-    except Exception: pass
-        
-    # Institutional Fallback (Only executed if yfinance entirely fails for intraday)
-    # Uses PAXGUSD which perfectly mirrors XAUUSD spot pricing without futures premiums.
     if df_1h.empty:
         try:
             res = requests.get("https://api.kraken.com/0/public/OHLC?pair=PAXGUSD&interval=60", timeout=5).json()
@@ -66,6 +82,18 @@ def fetch_mtf_data():
             df['time'] = pd.to_datetime(df['time'], unit='s', utc=True)
             df_1h = df.set_index('time')[['Open', 'High', 'Low', 'Close', 'Volume']].astype(float)
         except Exception: pass
+
+    # Convert valid 1H to 4H 
+    if not df_1h.empty:
+        df_4h = df_1h.resample('4h').agg({'Open':'first', 'High':'max', 'Low':'min', 'Close':'last', 'Volume':'sum'}).dropna()
+
+    # 2. Fetch 14-Day 15m Data (Independent)
+    try:
+        d_15 = yf.download(target_ticker, period="14d", interval="15m", progress=False, session=session)
+        if not d_15.empty:
+            if isinstance(d_15.columns, pd.MultiIndex): d_15.columns = d_15.columns.get_level_values(0)
+            df_15m = d_15[['Open', 'High', 'Low', 'Close', 'Volume']].dropna()
+    except Exception: pass
 
     if df_15m.empty:
         try:
@@ -83,15 +111,13 @@ def fetch_mtf_data():
         st.error("CRITICAL ERROR: Unable to fetch real market data from Yahoo Finance or Kraken. Backtest cannot run. Please try again later or check your network firewall.")
         st.stop() 
 
-    # Convert valid 1H to 4H 
-    df_4h = df_1h.resample('4h').agg({'Open':'first', 'High':'max', 'Low':'min', 'Close':'last', 'Volume':'sum'}).dropna()
-
     # Standardize Timezones to Indian Standard Time (IST)
     for df in [df_15m, df_1h, df_4h]:
-        if df.index.tz is None: 
-            df.index = df.index.tz_localize('UTC').tz_convert('Asia/Kolkata')
-        else: 
-            df.index = df.index.tz_convert('Asia/Kolkata')
+        if not df.empty:
+            if df.index.tz is None: 
+                df.index = df.index.tz_localize('UTC').tz_convert('Asia/Kolkata')
+            else: 
+                df.index = df.index.tz_convert('Asia/Kolkata')
 
     return df_15m, df_1h, df_4h
 
@@ -206,8 +232,6 @@ def run_quantum_backtest(df_1h, capital=10000, risk_pct=2.0):
 
 # --- RENDER DASHBOARD ---
 df_15m, df_1h, df_4h = fetch_mtf_data()
-
-# NEW: Fetch Live Ticking Spot Price
 live_spot = get_live_spot(df_15m)
 
 tab_live, tab_backtest = st.tabs(["🚀 Live Quantum Execution Desk", "📊 6-Month Backtest Results"])
