@@ -13,30 +13,69 @@ st.title("Gold (XAUUSD) — 5-Stage Quantum Algo Execution Desk")
 # --- STAGE 01: MARKET DATA INGESTION ---
 @st.cache_data(ttl=30)
 def fetch_mtf_data():
-    """Ingests multi-timeframe data for confluence checks."""
-    # Cloud Fallback (MEXC PAXGUSDT) for highest uptime
+    """Ingests multi-timeframe data with strict fail-safes."""
+    df_15m, df_1h, df_4h = pd.DataFrame(), pd.DataFrame(), pd.DataFrame()
+    
+    # Priority 1: Cloud Fallback (MEXC PAXGUSDT)
     def get_mexc(interval):
         try:
             res = requests.get(f"https://api.mexc.com/api/v3/klines?symbol=PAXGUSDT&interval={interval}&limit=500", timeout=3).json()
             df = pd.DataFrame(res, columns=['time', 'Open', 'High', 'Low', 'Close', 'Volume', 'ct', 'qav', 'nt', 'tbb', 'tbq'])
             df['time'] = pd.to_datetime(df['time'].astype(int), unit='ms', utc=True)
-            df = df[['time', 'Open', 'High', 'Low', 'Close', 'Volume']].set_index('time').astype(float).sort_index()
-            return df
+            return df[['time', 'Open', 'High', 'Low', 'Close', 'Volume']].set_index('time').astype(float).sort_index()
         except: return pd.DataFrame()
 
     df_15m = get_mexc("15m")
     df_1h = get_mexc("60m")
     df_4h = get_mexc("4h")
 
-    # yfinance priority override if available
-    if df_15m.empty:
+    # Priority 2: yfinance Override 
+    if df_15m.empty or df_1h.empty:
         try:
-            df_15m = yf.download("XAUUSD=X", period="10d", interval="15m", progress=False)
-            df_1h = yf.download("XAUUSD=X", period="30d", interval="1h", progress=False)
-            df_4h = yf.download("XAUUSD=X", period="60d", interval="1h", progress=False).resample('4h').agg({'Open':'first', 'High':'max', 'Low':'min', 'Close':'last', 'Volume':'sum'}).dropna()
-            for df in [df_15m, df_1h, df_4h]:
-                if isinstance(df.columns, pd.MultiIndex): df.columns = df.columns.get_level_values(0)
-        except: pass
+            d_15 = yf.download("XAUUSD=X", period="10d", interval="15m", progress=False)
+            d_1h = yf.download("XAUUSD=X", period="30d", interval="1h", progress=False)
+            d_4h_base = yf.download("XAUUSD=X", period="60d", interval="1h", progress=False)
+            
+            if not d_15.empty: df_15m = d_15
+            if not d_1h.empty: df_1h = d_1h
+            
+            # Prevent crashes by ensuring the dataframe isn't empty before resampling
+            if not d_4h_base.empty:
+                if isinstance(d_4h_base.columns, pd.MultiIndex):
+                    d_4h_base.columns = d_4h_base.columns.get_level_values(0)
+                df_4h = d_4h_base.resample('4h').agg({'Open':'first', 'High':'max', 'Low':'min', 'Close':'last', 'Volume':'sum'}).dropna()
+        except Exception:
+            pass
+
+    # Standardize column headers for MultiIndex yfinance updates
+    for df in [df_15m, df_1h, df_4h]:
+        if not df.empty and isinstance(df.columns, pd.MultiIndex): 
+            df.columns = df.columns.get_level_values(0)
+
+    # Priority 3: Fail-Safe Synthetic Injection (Prevents empty UI)
+    if df_15m.empty or df_1h.empty or df_4h.empty:
+        st.warning("Live API endpoints unreachable (Rate limited). Injecting simulated market data to render layout.")
+        np.random.seed(42)
+        base_p = 4195.00
+        
+        def make_synth(periods, freq, vol):
+            idx = pd.date_range(end=pd.Timestamp.utcnow(), periods=periods, freq=freq)
+            c = base_p + np.random.randn(periods).cumsum() * vol
+            d = pd.DataFrame({'Close': c}, index=idx)
+            d['Open'] = d['Close'] + np.random.randn(periods)
+            d['High'] = d[['Open', 'Close']].max(axis=1) + abs(np.random.randn(periods))
+            d['Low'] = d[['Open', 'Close']].min(axis=1) - abs(np.random.randn(periods))
+            d['Volume'] = np.random.randint(100, 1000, periods)
+            return d
+            
+        df_15m = make_synth(200, '15min', 1.5)
+        df_1h = make_synth(200, '1h', 3.0)
+        df_4h = make_synth(200, '4h', 5.0)
+
+    # Standardize Timezones to prevent SMC plotting errors
+    for df in [df_15m, df_1h, df_4h]:
+        if df.index.tz is None: df.index = df.index.tz_localize('UTC')
+        else: df.index = df.index.tz_convert('UTC')
 
     return df_15m, df_1h, df_4h
 
