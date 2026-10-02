@@ -13,41 +13,34 @@ st.title("Gold (XAUUSD) — 5-Stage Quantum Algo & 6-Month Backtest")
 # --- STAGE 01: BULLETPROOF MARKET DATA INGESTION ---
 @st.cache_data(ttl=60)
 def fetch_mtf_data():
-    """Ingests data with isolated timeframes to bypass 720-candle Kraken limits."""
+    """Ingests data strictly from reliable APIs. Refuses to inject synthetic data."""
     df_15m, df_1h, df_4h = pd.DataFrame(), pd.DataFrame(), pd.DataFrame()
     
     session = requests.Session()
     session.headers.update({'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36'})
     
+    # Use GC=F (Gold Futures) instead of XAUUSD=X for better yfinance API reliability
+    target_ticker = "GC=F"
+    
     # 1. Fetch 6-Month 1H Data (Independent)
     try:
-        d_1h = yf.download("XAUUSD=X", period="6mo", interval="1h", progress=False, session=session)
+        d_1h = yf.download(target_ticker, period="6mo", interval="1h", progress=False, session=session)
         if not d_1h.empty:
             if isinstance(d_1h.columns, pd.MultiIndex): d_1h.columns = d_1h.columns.get_level_values(0)
             df_1h = d_1h[['Open', 'High', 'Low', 'Close', 'Volume']].dropna()
-    except Exception: pass
-
-    if df_1h.empty:
-        np.random.seed(42)
-        idx_1h = pd.date_range(end=pd.Timestamp.utcnow(), periods=4320, freq='1h')
-        c = 4195.00 + np.random.randn(4320).cumsum() * 1.5
-        df_1h = pd.DataFrame({'Close': c}, index=idx_1h)
-        df_1h['Open'] = df_1h['Close'] + np.random.randn(4320)
-        df_1h['High'] = df_1h[['Open', 'Close']].max(axis=1) + abs(np.random.randn(4320))
-        df_1h['Low'] = df_1h[['Open', 'Close']].min(axis=1) - abs(np.random.randn(4320))
-        df_1h['Volume'] = np.random.randint(500, 2000, 4320)
-
-    # Convert valid 1H to 4H 
-    df_4h = df_1h.resample('4h').agg({'Open':'first', 'High':'max', 'Low':'min', 'Close':'last', 'Volume':'sum'}).dropna()
+    except Exception as e: 
+        st.error(f"1H Data Connection Failed: {e}")
 
     # 2. Fetch 14-Day 15m Data (Independent)
     try:
-        d_15 = yf.download("XAUUSD=X", period="14d", interval="15m", progress=False, session=session)
+        d_15 = yf.download(target_ticker, period="14d", interval="15m", progress=False, session=session)
         if not d_15.empty:
             if isinstance(d_15.columns, pd.MultiIndex): d_15.columns = d_15.columns.get_level_values(0)
             df_15m = d_15[['Open', 'High', 'Low', 'Close', 'Volume']].dropna()
-    except Exception: pass
-
+    except Exception as e: 
+        st.error(f"15M Data Connection Failed: {e}")
+        
+    # Institutional Fallback (Only executed if yfinance entirely fails for intraday)
     if df_15m.empty:
         try:
             res = requests.get("https://api.kraken.com/0/public/OHLC?pair=PAXGUSD&interval=15", timeout=5).json()
@@ -56,7 +49,16 @@ def fetch_mtf_data():
             df['time'] = pd.to_datetime(df['time'], unit='s', utc=True)
             df_15m = df.set_index('time')[['Open', 'High', 'Low', 'Close', 'Volume']].astype(float)
         except Exception:
-            df_15m = df_1h.tail(1000)
+            if not df_1h.empty:
+                df_15m = df_1h.tail(1000)
+
+    # Hard Stop if NO data is retrieved
+    if df_1h.empty or df_15m.empty:
+        st.error("CRITICAL ERROR: Unable to fetch real market data from Yahoo Finance or Kraken. Backtest cannot run. Please try again later or check your network firewall.")
+        st.stop() # Halts execution instead of generating fake data
+
+    # Convert valid 1H to 4H 
+    df_4h = df_1h.resample('4h').agg({'Open':'first', 'High':'max', 'Low':'min', 'Close':'last', 'Volume':'sum'}).dropna()
 
     # Standardize Timezones to Indian Standard Time (IST)
     for df in [df_15m, df_1h, df_4h]:
