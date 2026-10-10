@@ -43,7 +43,7 @@ def get_live_spot(df_fallback):
         return float(df_fallback['Close'].iloc[-1])
     return 4150.00
 
-# --- STAGE 01: BULLETPROOF DATA INGESTION ---
+# --- STAGE 01: DATA INGESTION ---
 @st.cache_data(ttl=60)
 def fetch_data():
     """Fetches 15m and 1H data with redundant fallbacks to survive cloud IP bans."""
@@ -70,7 +70,7 @@ def fetch_data():
     except Exception:
         pass
 
-    # Priority 2: Kraken PAXG Fallback (Bypasses Streamlit Cloud IP restrictions)
+    # Priority 2: Kraken PAXG Fallback
     if df_1h.empty:
         try:
             res = requests.get("https://api.kraken.com/0/public/OHLC?pair=PAXGUSD&interval=60", timeout=5).json()
@@ -92,7 +92,7 @@ def fetch_data():
             if not df_1h.empty:
                 df_15m = df_1h.tail(1000)
 
-    # Priority 3: Fail-safe synthetic generation if cloud host blocks all external APIs
+    # Priority 3: Offline fail-safe
     if df_1h.empty:
         idx_1h = pd.date_range(end=pd.Timestamp.utcnow(), periods=4320, freq='1h')
         c = 4150.00 + np.random.randn(4320).cumsum() * 1.5
@@ -122,13 +122,12 @@ def fetch_data():
             else:
                 df.index = df.index.tz_convert('Asia/Kolkata')
                 
-    return df_15m, df_4h
+    return df_15m, df_1h, df_4h
 
 # --- STRATEGY LOGIC ENGINE ---
 def apply_zeno_logic(df_15, df_4h):
     df = df_15.copy()
     
-    # 1. Macro Trend (4H Bias) with safety check
     if not df_4h.empty and len(df_4h) >= 50:
         df_4h_calc = df_4h.copy()
         df_4h_calc['EMA_50'] = df_4h_calc['Close'].ewm(span=50).mean()
@@ -136,25 +135,136 @@ def apply_zeno_logic(df_15, df_4h):
     else:
         bias_4h = "NEUTRAL"
     
-    # 2. Volatility (ATR) for Dynamic Stops/Targets
     df['High-Low'] = df['High'] - df['Low']
     df['High-PrevClose'] = abs(df['High'] - df['Close'].shift(1))
     df['Low-PrevClose'] = abs(df['Low'] - df['Close'].shift(1))
     df['TR'] = df[['High-Low', 'High-PrevClose', 'Low-PrevClose']].max(axis=1)
     df['ATR'] = df['TR'].rolling(14).mean().bfill()
-    
-    # 3. Dynamic Baseline (SMA Retest Zone)
     df['SMA_20'] = df['Close'].rolling(20).mean().bfill()
     
-    # 4. Session Filter (Skip Asian Session)
-    # Asian Session: ~02:30 to 11:30 IST. London/NY active: 12:00 to 23:00 IST.
+    # Active Session in IST: London/NY active from 12:00 to 23:00 IST
     current_hour = datetime.now(pytz.timezone('Asia/Kolkata')).hour
     is_active_session = 12 <= current_hour <= 23
     
     return df, bias_4h, is_active_session
 
-# --- EXECUTION & DASHBOARD ---
-df_15m, df_4h = fetch_data()
+# --- 6-MONTH BACKTEST ENGINE ---
+def run_zeno_backtest(df_hist_1h, df_hist_4h, capital=10000.0, risk_pct=2.0):
+    """Backtests the Zeno 4H Trend, SMA20 Retest, and 50% TP1+BE / TP2 Exit Strategy."""
+    df = df_hist_1h.copy()
+    df_4h_calc = df_hist_4h.copy()
+    df_4h_calc['EMA_50_4H'] = df_4h_calc['Close'].ewm(span=50).mean()
+    df['EMA_50_4H'] = df_4h_calc['EMA_50_4H'].reindex(df.index, method='ffill')
+    
+    df['SMA_20'] = df['Close'].rolling(20).mean()
+    df['High-Low'] = df['High'] - df['Low']
+    df['High-PrevClose'] = abs(df['High'] - df['Close'].shift(1))
+    df['Low-PrevClose'] = abs(df['Low'] - df['Close'].shift(1))
+    df['TR'] = df[['High-Low', 'High-PrevClose', 'Low-PrevClose']].max(axis=1)
+    df['ATR'] = df['TR'].rolling(14).mean().bfill()
+    df['Active_Session'] = df.index.hour.map(lambda h: 12 <= h <= 23)
+    
+    trades, equity_curve, dates = [], [capital], [df.index[0]]
+    in_trade = False
+    t_type = None
+    entry_p, sl_p, tp1_p, tp2_p = 0.0, 0.0, 0.0, 0.0
+    tp1_hit = False
+    e_date = None
+    equity = float(capital)
+    
+    for i in range(50, len(df)):
+        c = df.iloc[i]
+        date = df.index[i]
+        
+        if not in_trade:
+            if not c['Active_Session'] or pd.isna(c['EMA_50_4H']) or pd.isna(c['SMA_20']) or pd.isna(c['ATR']):
+                continue
+            
+            trend_bull = c['Close'] > c['EMA_50_4H']
+            trend_bear = c['Close'] < c['EMA_50_4H']
+            retest_baseline = (c['Low'] <= c['SMA_20'] <= c['High'])
+            
+            if trend_bull and retest_baseline:
+                in_trade = True
+                t_type = 'BUY'
+                entry_p = c['SMA_20']
+                sl_p = entry_p - (c['ATR'] * 1.5)
+                tp1_p = entry_p + (c['ATR'] * 1.5)
+                tp2_p = entry_p + (c['ATR'] * 3.0)
+                tp1_hit = False
+                e_date = date
+            elif trend_bear and retest_baseline:
+                in_trade = True
+                t_type = 'SELL'
+                entry_p = c['SMA_20']
+                sl_p = entry_p + (c['ATR'] * 1.5)
+                tp1_p = entry_p - (c['ATR'] * 1.5)
+                tp2_p = entry_p - (c['ATR'] * 3.0)
+                tp1_hit = False
+                e_date = date
+        else:
+            risk_amt = equity * (risk_pct / 100.0)
+            
+            if t_type == 'BUY':
+                if not tp1_hit and c['High'] >= tp1_p:
+                    tp1_hit = True
+                    sl_p = entry_p
+                
+                if c['Low'] <= sl_p:
+                    net_pnl = risk_amt * 0.5 if tp1_hit else -risk_amt
+                    equity += net_pnl
+                    trades.append({
+                        'Entry Date': e_date, 'Exit Date': date, 'Type': 'BUY',
+                        'Entry': entry_p, 'Stop Loss': sl_p, 'Exit': sl_p,
+                        'Result': 'Half Win (+BE)' if tp1_hit else 'Loss', 'Net ($)': net_pnl
+                    })
+                    in_trade = False
+                elif c['High'] >= tp2_p:
+                    net_pnl = risk_amt * 1.5
+                    equity += net_pnl
+                    trades.append({
+                        'Entry Date': e_date, 'Exit Date': date, 'Type': 'BUY',
+                        'Entry': entry_p, 'Stop Loss': sl_p, 'Exit': tp2_p,
+                        'Result': 'Full Win (TP2)', 'Net ($)': net_pnl
+                    })
+                    in_trade = False
+                    
+            elif t_type == 'SELL':
+                if not tp1_hit and c['Low'] <= tp1_p:
+                    tp1_hit = True
+                    sl_p = entry_p
+                
+                if c['High'] >= sl_p:
+                    net_pnl = risk_amt * 0.5 if tp1_hit else -risk_amt
+                    equity += net_pnl
+                    trades.append({
+                        'Entry Date': e_date, 'Exit Date': date, 'Type': 'SELL',
+                        'Entry': entry_p, 'Stop Loss': sl_p, 'Exit': sl_p,
+                        'Result': 'Half Win (+BE)' if tp1_hit else 'Loss', 'Net ($)': net_pnl
+                    })
+                    in_trade = False
+                elif c['Low'] <= tp2_p:
+                    net_pnl = risk_amt * 1.5
+                    equity += net_pnl
+                    trades.append({
+                        'Entry Date': e_date, 'Exit Date': date, 'Type': 'SELL',
+                        'Entry': entry_p, 'Stop Loss': sl_p, 'Exit': tp2_p,
+                        'Result': 'Full Win (TP2)', 'Net ($)': net_pnl
+                    })
+                    in_trade = False
+                    
+            if not in_trade:
+                equity_curve.append(equity)
+                dates.append(date)
+                
+    if dates[-1] != df.index[-1]:
+        dates.append(df.index[-1])
+        equity_curve.append(equity)
+        
+    return trades, dates, equity_curve
+
+# --- DATA INITIALIZATION ---
+df_15m, df_1h, df_4h = fetch_data()
 df_15m_logic, trend_4h, is_active_session = apply_zeno_logic(df_15m, df_4h)
 
 live_spot = get_live_spot(df_15m_logic)
@@ -162,10 +272,9 @@ last_candle = df_15m_logic.iloc[-2] if len(df_15m_logic) >= 2 else df_15m_logic.
 current_atr = last_candle['ATR'] if pd.notna(last_candle['ATR']) else 5.0
 baseline = last_candle['SMA_20'] if pd.notna(last_candle['SMA_20']) else live_spot
 
-# Smart Entry Trigger Logic (Pullback Retest)
+# Smart Entry Trigger Logic
 signal = "IDLE (Waiting for Setup)"
 color = "gray"
-
 is_retesting = abs(live_spot - baseline) <= (current_atr * 0.25)
 
 if is_active_session and is_retesting:
@@ -179,7 +288,7 @@ elif not is_active_session:
     signal = "SKIPPED (Asian Consolidation)"
     color = "orange"
 
-# UI Rendering
+# Top Metrics
 col1, col2, col3 = st.columns(3)
 col1.metric("Live XAUUSD Spot", f"${live_spot:,.2f}")
 col2.metric("Execution Status", f":{color}[{signal}]")
@@ -187,9 +296,8 @@ col3.metric("Macro Trend (4H)", trend_4h)
 
 st.divider()
 
-# --- LIVE TRADE TICKET (ATR RISK ENGINE) ---
+# --- LIVE TRADE TICKET ---
 st.markdown("### 📝 Smart Entry Trade Ticket")
-
 if "LONG" in signal:
     entry = live_spot
     sl = entry - (current_atr * 1.5)
@@ -212,37 +320,78 @@ t4.metric("TP2 (Full Exit)", f"${tp2:,.2f}" if tp2 else "N/A")
 
 st.divider()
 
-# --- PIPELINE STATUS ---
+# --- PIPELINE VALIDATION ---
 st.markdown("### 🔍 Logic Pipeline Validation")
 v1, v2, v3 = st.columns(3)
-
 if is_active_session:
     v1.success("✅ Session Filter\nLondon/NY Active")
 else:
     v1.warning("⏳ Session Filter\nSkipping Asian Chop")
-
 v2.info(f"⚡ Macro Trend\nAligned {trend_4h}")
-
 if is_retesting:
     v3.success("✅ Pullback Retest\nPrice at Baseline")
 else:
     v3.warning("⏳ Pullback Retest\nAwaiting Mean Reversion")
 
-# --- CHART RENDERING ---
+# --- CHART ---
 st.subheader("15M Retest Chart & Baseline Envelope")
 df_plot = df_15m_logic.tail(100)
 fig, ax = plt.subplots(figsize=(14, 5))
-
 ax.plot(df_plot.index, df_plot['Close'], color='black', linewidth=1.5, label='XAUUSD Price')
 ax.plot(df_plot.index, df_plot['SMA_20'], color='orange', linewidth=2, alpha=0.7, label='Dynamic Entry Baseline (SMA 20)')
 ax.axhline(live_spot, color='blue', linestyle=':', label=f"Live Spot ${live_spot:,.2f}")
-
 if sl:
     ax.axhline(sl, color='red', linestyle='--', label="Dynamic Stop Loss")
     ax.axhline(tp1, color='green', linestyle='--', label="TP1 (+ BE)")
     ax.axhline(tp2, color='darkgreen', linestyle='-', linewidth=2, label="TP2 Full Exit")
-
 ax.xaxis.set_major_formatter(mdates.DateFormatter('%b %d - %H:%M\nIST'))
 ax.legend(loc='upper left', bbox_to_anchor=(1.01, 1))
 ax.grid(alpha=0.2)
 st.pyplot(fig)
+
+# ================= 6-MONTH BACKTEST RESULTS (DIRECT SECTION) =================
+st.divider()
+st.subheader("📊 6-Month Historical Zeno Strategy Performance ($10,000 Starting Capital)")
+
+b_col1, b_col2 = st.columns([1, 2])
+with b_col1:
+    capital = st.number_input("Starting Capital ($)", min_value=1000, value=10000, step=1000)
+with b_col2:
+    risk_pct = st.slider("Risk Per Trade (%)", 1.0, 5.0, 2.0, 0.5)
+
+trades, dates, equity = run_zeno_backtest(df_1h, df_4h, capital, risk_pct)
+total_trades = len(trades)
+
+if total_trades > 0:
+    wins = len([t for t in trades if 'Win' in t['Result']])
+    win_rate = (wins / total_trades) * 100.0
+    net_profit = equity[-1] - capital
+    
+    m1, m2, m3, m4 = st.columns(4)
+    m1.metric("Total Executed Trades", total_trades)
+    m2.metric("System Win Ratio", f"{win_rate:.1f}%")
+    color_net = f":green[${net_profit:,.2f}]" if net_profit > 0 else f":red[${net_profit:,.2f}]"
+    m3.markdown(f"**Net Profit (6 Mo)**\n### {color_net}")
+    m4.metric("Ending Account Equity", f"${equity[-1]:,.2f}")
+    
+    st.divider()
+    st.subheader("Historical Trade Ledger (IST Timezone)")
+    df_trades = pd.DataFrame(trades)
+    df_trades['Entry Date'] = df_trades['Entry Date'].dt.strftime('%Y-%m-%d %H:%M')
+    df_trades['Exit Date'] = df_trades['Exit Date'].dt.strftime('%Y-%m-%d %H:%M')
+    for col in ['Entry', 'Stop Loss', 'Exit', 'Net ($)']:
+        df_trades[col] = df_trades[col].apply(lambda x: f"${x:,.2f}")
+    st.dataframe(df_trades.iloc[::-1], use_container_width=True, hide_index=True)
+    
+    st.divider()
+    st.subheader("Portfolio Equity Growth Curve")
+    fig_eq, ax_eq = plt.subplots(figsize=(14, 5))
+    ax_eq.plot(dates, equity, color='teal', linewidth=2, label="Account Equity")
+    ax_eq.axhline(capital, color='black', linestyle='--', linewidth=1, label="Initial Capital")
+    ax_eq.xaxis.set_major_formatter(mdates.DateFormatter('%b %Y'))
+    ax_eq.set_ylabel('Balance (USD)')
+    ax_eq.legend(loc='upper left')
+    ax_eq.grid(alpha=0.25)
+    st.pyplot(fig_eq)
+else:
+    st.warning("No setup triggers fired within the 6-month historical window under the Zeno parameters.")
