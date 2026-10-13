@@ -6,6 +6,8 @@ from scipy.signal import argrelextrema
 import matplotlib.pyplot as plt
 import matplotlib.dates as mdates
 import requests
+import smtplib
+from email.mime.text import MIMEText
 
 st.set_page_config(page_title="Quantum Algo | XAUUSD Engine & Backtest", layout="wide")
 st.title("Gold (XAUUSD) — 5-Stage Quantum Algo & 6-Month Backtest")
@@ -239,6 +241,42 @@ tab_live, tab_backtest = st.tabs(["🚀 Live Quantum Execution Desk", "📊 6-Mo
 # ================= TAB 1: LIVE EXECUTION =================
 with tab_live:
     mtf_bias, mtf_aligned = check_mtf_alignment(df_1h, df_4h)
+    
+    # ---------------- EMAIL NOTIFICATION TRIGGER (VIA SECRETS) ----------------
+    # Initialize session state to remember the previous MTF bias
+    if 'prev_mtf_bias' not in st.session_state:
+        st.session_state.prev_mtf_bias = mtf_bias
+
+    # Check if the bias has changed since the last script execution
+    if st.session_state.prev_mtf_bias != mtf_bias:
+        
+        try:
+            # Securely fetch credentials from Streamlit Secrets
+            sender_email = st.secrets["EMAIL_SENDER"]
+            sender_app_password = st.secrets["EMAIL_PASSWORD"]
+            recipient_email = "sundarvp27@gmail.com"
+            
+            msg = MIMEText(f"Quantum Algo Alert: The MTF Confluence has changed from {st.session_state.prev_mtf_bias} to {mtf_bias} on XAUUSD.")
+            msg['Subject'] = f"MTF Confluence Update: {mtf_bias}"
+            msg['From'] = sender_email
+            msg['To'] = recipient_email
+            
+            with smtplib.SMTP_SSL('smtp.gmail.com', 465) as server:
+                server.login(sender_email, sender_app_password)
+                server.sendmail(sender_email, [recipient_email], msg.as_string())
+            
+            # Optional: Show a subtle success message on the dashboard when an email fires
+            st.toast("MTF Bias changed! Email notification dispatched.", icon="📩")
+        
+        except KeyError:
+            st.warning("Email secrets not found. Please configure EMAIL_SENDER and EMAIL_PASSWORD in Streamlit deployment secrets.")
+        except Exception as e:
+            st.warning(f"Failed to send email alert: {e}")
+        
+        # Update the session state to the new bias so it doesn't fire continuously
+        st.session_state.prev_mtf_bias = mtf_bias
+    # ------------------------------------------------------------
+
     bsl, ssl, eq, bull_fvg, bear_fvg = map_smc_zones(df_15m)
     df_15m_filtered = apply_adaptive_filters(df_15m)
     last = df_15m_filtered.iloc[-2] # Lock to closed candle
