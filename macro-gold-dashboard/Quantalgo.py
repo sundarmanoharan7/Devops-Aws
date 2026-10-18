@@ -6,79 +6,67 @@ from scipy.signal import argrelextrema
 import matplotlib.pyplot as plt
 import matplotlib.dates as mdates
 import requests
-import smtplib
-from email.mime.text import MIMEText
-import time
 
 st.set_page_config(page_title="Quantum Algo | XAUUSD Engine & Backtest", layout="wide")
 st.title("Gold (XAUUSD) — 5-Stage Quantum Algo & 6-Month Backtest")
 
-# --- SIDEBAR DIAGNOSTICS & SYSTEM CONTROLS ---
-with st.sidebar:
-    st.markdown("### ⚙️ System Controls")
-    
-    # 1. Test Button to verify SMTP credentials instantly
-    if st.button("📩 Send Test Email"):
-        try:
-            sender_email = st.secrets["EMAIL_SENDER"]
-            sender_app_password = st.secrets["EMAIL_PASSWORD"]
-            recipient_email = "sundarvp27@gmail.com"
-            
-            msg = MIMEText("This is a test email. Your Quantum Algo SMTP configuration is working perfectly.")
-            msg['Subject'] = "Quantum Algo: SMTP Test Successful"
-            msg['From'] = sender_email
-            msg['To'] = recipient_email
-            
-            with smtplib.SMTP_SSL('smtp.gmail.com', 465) as server:
-                server.login(sender_email, sender_app_password)
-                server.sendmail(sender_email, [recipient_email], msg.as_string())
-            st.success("✅ Test email sent! Check your inbox.")
-        except KeyError:
-            st.error("❌ Secret missing. Add EMAIL_SENDER and EMAIL_PASSWORD to st.secrets.")
-        except Exception as e:
-            st.error(f"❌ SMTP Error: {e}")
-
-    st.divider()
-    # 2. Keep-Alive Toggle to prevent Streamlit from sleeping
-    auto_refresh = st.checkbox("Enable 60s Auto-Refresh (Keep Alive)", value=False)
-    if auto_refresh:
-        st.info("App will automatically refresh every 60 seconds to check for MTF changes.")
-
-# --- STAGE 00: REAL-TIME SPOT TICKER ---
+# --- STAGE 00: REAL-TIME SPOT TICKER (SYNCHRONIZED WITH TRADINGVIEW) ---
 @st.cache_data(ttl=5)
 def get_live_spot(df_fallback):
+    """Pings TradingView's FXCM CFD scanner directly to match chart ticks in real time."""
     headers = {
         'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36',
         'Origin': 'https://www.tradingview.com',
         'Referer': 'https://www.tradingview.com/'
     }
+    
+    # Priority 1: Direct TradingView FXCM / OANDA Live Scanner
     try:
         url = "https://scanner.tradingview.com/cfd/scan"
-        payload = {"symbols": {"tickers": ["FXCM:XAUUSD", "OANDA:XAUUSD"]}, "columns": ["close", "bid", "ask"]}
+        payload = {
+            "symbols": {"tickers": ["FXCM:XAUUSD", "OANDA:XAUUSD"]},
+            "columns": ["close", "bid", "ask"]
+        }
         res = requests.post(url, json=payload, headers=headers, timeout=3)
         if res.status_code == 200:
             data = res.json().get('data', [])
             if data and len(data) > 0:
                 tv_price = data[0].get('d', [0])[0]
-                if tv_price and float(tv_price) > 1000: return float(tv_price)
+                if tv_price and float(tv_price) > 1000:
+                    return float(tv_price)
     except Exception: pass
 
+    # Priority 2: KuCoin PAXG/USDT Raw Order Book (Ticking spot proxy)
     try:
         res = requests.get("https://api.kucoin.com/api/v1/market/orderbook/level1?symbol=PAXG-USDT", timeout=2).json()
         price = res.get('data', {}).get('price')
-        if price and float(price) > 1000: return float(price)
+        if price and float(price) > 1000:
+            return float(price)
     except Exception: pass
 
+    # Priority 3: MEXC Live Ticker
+    try:
+        res = requests.get("https://api.mexc.com/api/v3/ticker/price?symbol=PAXGUSDT", timeout=2).json()
+        if float(res['price']) > 1000:
+            return float(res['price'])
+    except Exception: pass
+
+    # Priority 4: Closed candle fallback
     return float(df_fallback['Close'].iloc[-1])
 
 # --- STAGE 01: BULLETPROOF MARKET DATA INGESTION ---
 @st.cache_data(ttl=60)
 def fetch_mtf_data():
+    """Ingests data with isolated timeframes to bypass 720-candle Kraken limits."""
     df_15m, df_1h, df_4h = pd.DataFrame(), pd.DataFrame(), pd.DataFrame()
+    
     session = requests.Session()
-    session.headers.update({'User-Agent': 'Mozilla/5.0'})
+    session.headers.update({'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36'})
+    
+    # TARGET RESTORED TO SPOT GOLD
     target_ticker = "XAUUSD=X"
     
+    # 1. Fetch 6-Month 1H Data (Independent)
     try:
         d_1h = yf.download(target_ticker, period="6mo", interval="1h", progress=False, session=session)
         if not d_1h.empty:
@@ -95,9 +83,11 @@ def fetch_mtf_data():
             df_1h = df.set_index('time')[['Open', 'High', 'Low', 'Close', 'Volume']].astype(float)
         except Exception: pass
 
+    # Convert valid 1H to 4H 
     if not df_1h.empty:
         df_4h = df_1h.resample('4h').agg({'Open':'first', 'High':'max', 'Low':'min', 'Close':'last', 'Volume':'sum'}).dropna()
 
+    # 2. Fetch 14-Day 15m Data (Independent)
     try:
         d_15 = yf.download(target_ticker, period="14d", interval="15m", progress=False, session=session)
         if not d_15.empty:
@@ -106,16 +96,28 @@ def fetch_mtf_data():
     except Exception: pass
 
     if df_15m.empty:
-        if not df_1h.empty: df_15m = df_1h.tail(1000)
+        try:
+            res = requests.get("https://api.kraken.com/0/public/OHLC?pair=PAXGUSD&interval=15", timeout=5).json()
+            data = res['result'][list(res['result'].keys())[0]]
+            df = pd.DataFrame(data, columns=['time', 'Open', 'High', 'Low', 'Close', 'vwap', 'Volume', 'count'])
+            df['time'] = pd.to_datetime(df['time'], unit='s', utc=True)
+            df_15m = df.set_index('time')[['Open', 'High', 'Low', 'Close', 'Volume']].astype(float)
+        except Exception:
+            if not df_1h.empty:
+                df_15m = df_1h.tail(1000)
 
+    # Hard Stop if NO data is retrieved
     if df_1h.empty or df_15m.empty:
-        st.error("CRITICAL ERROR: Unable to fetch real market data.")
+        st.error("CRITICAL ERROR: Unable to fetch real market data from Yahoo Finance or Kraken. Backtest cannot run. Please try again later or check your network firewall.")
         st.stop() 
 
+    # Standardize Timezones to Indian Standard Time (IST)
     for df in [df_15m, df_1h, df_4h]:
         if not df.empty:
-            if df.index.tz is None: df.index = df.index.tz_localize('UTC').tz_convert('Asia/Kolkata')
-            else: df.index = df.index.tz_convert('Asia/Kolkata')
+            if df.index.tz is None: 
+                df.index = df.index.tz_localize('UTC').tz_convert('Asia/Kolkata')
+            else: 
+                df.index = df.index.tz_convert('Asia/Kolkata')
 
     return df_15m, df_1h, df_4h
 
@@ -153,27 +155,47 @@ def apply_adaptive_filters(df):
 
 # --- 6-MONTH BACKTEST ENGINE ---
 def run_quantum_backtest(df_1h, capital=10000, risk_pct=2.0):
+    """Executes the Quantum 5-Stage validation logically across historical data."""
     df = apply_adaptive_filters(df_1h)
     df['EMA50'] = df['Close'].ewm(span=50, adjust=False).mean()
+    
     df['Swing_High'] = df['High'].rolling(20).max().shift(1)
     df['Swing_Low'] = df['Low'].rolling(20).min().shift(1)
     df['EQ'] = (df['Swing_High'] + df['Swing_Low']) / 2
     
     trades, equity_curve, dates = [], [capital], [df.index[0]]
-    in_trade, t_type, entry_p, sl_p, tp_p, e_date, equity = False, None, 0, 0, 0, None, capital
+    in_trade, t_type = False, None
+    entry_p, sl_p, tp_p, e_date = 0, 0, 0, None
+    equity = capital
     
     for i in range(50, len(df)):
         c = df.iloc[i]
         date = df.index[i]
         
         if not in_trade:
-            is_discount, is_premium = c['Close'] < c['EQ'], c['Close'] > c['EQ']
-            bull_bias, bear_bias = c['Close'] > c['EMA50'], c['Close'] < c['EMA50']
+            is_discount = c['Close'] < c['EQ']
+            is_premium = c['Close'] > c['EQ']
+            bull_bias = c['Close'] > c['EMA50']
+            bear_bias = c['Close'] < c['EMA50']
             
+            # Setup Buy
             if bull_bias and is_discount and c['RSI'] > 50 and c['Vol_Spike']:
-                in_trade, t_type, entry_p, sl_p, tp_p, e_date = True, 'BUY', c['Close'], c['Swing_Low'] - 6.50, c['Swing_High'], date
+                in_trade = True
+                t_type = 'BUY'
+                entry_p = c['Close']
+                sl_p = c['Swing_Low'] - 6.50
+                tp_p = c['Swing_High']
+                e_date = date
+                
+            # Setup Sell
             elif bear_bias and is_premium and c['RSI'] < 50 and c['Vol_Spike']:
-                in_trade, t_type, entry_p, sl_p, tp_p, e_date = True, 'SELL', c['Close'], c['Swing_High'] + 6.50, c['Swing_Low'], date
+                in_trade = True
+                t_type = 'SELL'
+                entry_p = c['Close']
+                sl_p = c['Swing_High'] + 6.50
+                tp_p = c['Swing_Low']
+                e_date = date
+                
         else:
             risk_amt = equity * (risk_pct / 100)
             if t_type == 'BUY':
@@ -186,6 +208,7 @@ def run_quantum_backtest(df_1h, capital=10000, risk_pct=2.0):
                     equity += risk_amt * rr
                     trades.append({'Entry Date': e_date, 'Exit Date': date, 'Type': 'BUY', 'Entry': entry_p, 'Stop Loss': sl_p, 'Exit': tp_p, 'Result': 'Win', 'Net ($)': risk_amt * rr})
                     in_trade = False
+                    
             elif t_type == 'SELL':
                 if c['High'] >= sl_p:
                     equity -= risk_amt
@@ -216,60 +239,41 @@ tab_live, tab_backtest = st.tabs(["🚀 Live Quantum Execution Desk", "📊 6-Mo
 # ================= TAB 1: LIVE EXECUTION =================
 with tab_live:
     mtf_bias, mtf_aligned = check_mtf_alignment(df_1h, df_4h)
-    
-    # ---------------- EMAIL NOTIFICATION TRIGGER ----------------
-    if 'prev_mtf_bias' not in st.session_state:
-        st.session_state.prev_mtf_bias = mtf_bias
-
-    if st.session_state.prev_mtf_bias != mtf_bias:
-        try:
-            sender_email = st.secrets["EMAIL_SENDER"]
-            sender_app_password = st.secrets["EMAIL_PASSWORD"]
-            recipient_email = "sundarvp27@gmail.com"
-            
-            msg = MIMEText(f"Quantum Algo Alert: The MTF Confluence has changed from {st.session_state.prev_mtf_bias} to {mtf_bias} on XAUUSD.")
-            msg['Subject'] = f"MTF Confluence Update: {mtf_bias}"
-            msg['From'] = sender_email
-            msg['To'] = recipient_email
-            
-            with smtplib.SMTP_SSL('smtp.gmail.com', 465) as server:
-                server.login(sender_email, sender_app_password)
-                server.sendmail(sender_email, [recipient_email], msg.as_string())
-            
-            st.toast("MTF Bias changed! Email notification dispatched.", icon="📩")
-        except KeyError:
-            st.warning("Email secrets not found. Please configure EMAIL_SENDER and EMAIL_PASSWORD in Streamlit deployment secrets.")
-        except Exception as e:
-            st.warning(f"Failed to send email alert: {e}")
-        
-        st.session_state.prev_mtf_bias = mtf_bias
-    # ------------------------------------------------------------
-
     bsl, ssl, eq, bull_fvg, bear_fvg = map_smc_zones(df_15m)
     df_15m_filtered = apply_adaptive_filters(df_15m)
-    last = df_15m_filtered.iloc[-2]
+    last = df_15m_filtered.iloc[-2] # Lock to closed candle
     
     signal, color = "NO SIGNAL", "gray"
     is_discount, is_premium = last['Close'] < eq, last['Close'] > eq
     has_mom_bull, has_mom_bear = last['RSI'] > 50, last['RSI'] < 50
     
-    if mtf_bias == "BULLISH" and is_discount and has_mom_bull and last['Vol_Spike']: signal, color = "BUY (Long)", "green"
-    elif mtf_bias == "BEARISH" and is_premium and has_mom_bear and last['Vol_Spike']: signal, color = "SELL (Short)", "red"
+    if mtf_bias == "BULLISH" and is_discount and has_mom_bull and last['Vol_Spike']:
+        signal, color = "BUY (Long)", "green"
+    elif mtf_bias == "BEARISH" and is_premium and has_mom_bear and last['Vol_Spike']:
+        signal, color = "SELL (Short)", "red"
 
     col1, col2, col3 = st.columns([1, 1, 1])
     col1.metric("Live XAUUSD Spot", f"${live_spot:,.2f}")
     col2.metric("Quantum Algo Signal", f":{color}[{signal}]")
     col3.metric("MTF Confluence (1H/4H)", mtf_bias)
 
+    # --- LIVE ORDER TICKET ---
     st.divider()
     st.markdown("### 📝 Live Order Ticket")
     
+    # Calculate Live Stops and Targets based on bias, regardless of active signal
     if mtf_bias == "BULLISH":
-        live_sl, live_tp, direction_text = ssl - 6.50, bsl, "Potential Long"
+        live_sl = ssl - 6.50
+        live_tp = bsl
+        direction_text = "Potential Long"
     elif mtf_bias == "BEARISH":
-        live_sl, live_tp, direction_text = bsl + 6.50, ssl, "Potential Short"
+        live_sl = bsl + 6.50
+        live_tp = ssl
+        direction_text = "Potential Short"
     else:
-        live_sl, live_tp, direction_text = ssl - 6.50, bsl, "Range Bound"
+        live_sl = ssl - 6.50  # Default to nearest support
+        live_tp = bsl         # Default to nearest resistance
+        direction_text = "Range Bound"
         
     t1, t2, t3 = st.columns(3)
     t1.metric(f"Target (Take Profit - {direction_text})", f"${live_tp:,.2f}")
@@ -278,6 +282,7 @@ with tab_live:
     risk_points = abs(live_spot - live_sl) if live_sl else 0
     reward_points = abs(live_tp - live_spot) if live_tp else 0
     rr_ratio = reward_points / risk_points if risk_points > 0 else 0
+    
     t3.metric("Projected Risk:Reward", f"{rr_ratio:.2f} R")
 
     st.divider()
@@ -356,9 +361,4 @@ with tab_backtest:
         ax_eq.grid(alpha=0.25)
         st.pyplot(fig_eq)
     else:
-        st.warning("No setup triggers fired within the 6-month historical window.")
-
-# --- AUTO-REFRESH KEEPALIVE ENGINE ---
-if auto_refresh:
-    time.sleep(60)
-    st.rerun()
+        st.warning("No setup triggers fired within the 6-month historical window under the strict 5-stage validation parameters.")
