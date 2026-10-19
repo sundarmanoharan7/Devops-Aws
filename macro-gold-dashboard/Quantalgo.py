@@ -121,8 +121,10 @@ def fetch_mtf_data():
 
 # --- CORE LOGIC FUNCTIONS ---
 def check_mtf_alignment(df_1h, df_4h):
-    bias_1h = df_1h['Close'].iloc[-1] > df_1h['Close'].ewm(span=50).mean().iloc[-1]
-    bias_4h = df_4h['Close'].iloc[-1] > df_4h['Close'].ewm(span=50).mean().iloc[-1]
+    ema_1h = df_1h['Close'].ewm(span=50).mean().iloc[-1]
+    ema_4h = df_4h['Close'].ewm(span=50).mean().iloc[-1]
+    bias_1h = df_1h['Close'].iloc[-1] > ema_1h
+    bias_4h = df_4h['Close'].iloc[-1] > ema_4h
     if bias_1h and bias_4h: return "BULLISH", True
     elif not bias_1h and not bias_4h: return "BEARISH", True
     else: return "MIXED", False
@@ -211,7 +213,11 @@ def run_quantum_backtest(df_1h, capital=10000, risk_pct=2.0):
 df_15m, df_1h, df_4h = fetch_mtf_data()
 live_spot = get_live_spot(df_15m)
 
-tab_live, tab_backtest = st.tabs(["🚀 Live Quantum Execution Desk", "📊 6-Month Backtest Results"])
+tab_live, tab_backtest, tab_mtf = st.tabs([
+    "🚀 Live Quantum Execution Desk", 
+    "📊 6-Month Backtest Results",
+    "📈 MTF Confluence Breakdown & Thresholds"
+])
 
 # ================= TAB 1: LIVE EXECUTION =================
 with tab_live:
@@ -357,6 +363,78 @@ with tab_backtest:
         st.pyplot(fig_eq)
     else:
         st.warning("No setup triggers fired within the 6-month historical window.")
+
+# ================= TAB 3: MTF CONFLUENCE THRESHOLDS & CHARTS =================
+with tab_mtf:
+    st.subheader("📊 MTF Confluence Price Flip Levels & Higher-Timeframe Trend")
+    
+    # Calculate exact 50 EMA values for 1H and 4H
+    df_1h_calc = df_1h.copy()
+    df_4h_calc = df_4h.copy()
+    df_1h_calc['EMA50'] = df_1h_calc['Close'].ewm(span=50).mean()
+    df_4h_calc['EMA50'] = df_4h_calc['Close'].ewm(span=50).mean()
+    
+    latest_1h_close = df_1h_calc['Close'].iloc[-1]
+    latest_1h_ema = df_1h_calc['EMA50'].iloc[-1]
+    latest_4h_close = df_4h_calc['Close'].iloc[-1]
+    latest_4h_ema = df_4h_calc['EMA50'].iloc[-1]
+    
+    # Required crossover thresholds
+    flip_to_mixed_price = min(latest_1h_ema, latest_4h_ema)
+    flip_to_bullish_price = max(latest_1h_ema, latest_4h_ema)
+    
+    diff_mixed = flip_to_mixed_price - live_spot
+    diff_bullish = flip_to_bullish_price - live_spot
+    
+    c_m1, c_m2, c_m3 = st.columns(3)
+    c_m1.metric("Live Gold Spot", f"${live_spot:,.2f}")
+    c_m2.metric(
+        "Flip to MIXED Level (1st Barrier)",
+        f"${flip_to_mixed_price:,.2f}",
+        f"{diff_mixed:+.2f} USD"
+    )
+    c_m3.metric(
+        "Flip to BULLISH Level (Full Aligned)",
+        f"${flip_to_bullish_price:,.2f}",
+        f"{diff_bullish:+.2f} USD"
+    )
+    
+    st.info(
+        f"💡 **Mechanics:** Because the status is **BEARISH**, price is trading below both the 1H EMA 50 (${latest_1h_ema:,.2f}) "
+        f"and 4H EMA 50 (${latest_4h_ema:,.2f}). To flip the status to **MIXED**, Gold must cross above **${flip_to_mixed_price:,.2f}**. "
+        f"To flip the status to **BULLISH**, Gold must cross and close above **${flip_to_bullish_price:,.2f}**."
+    )
+    
+    st.divider()
+    
+    # Plotting 1H and 4H charts side-by-side
+    p_col1, p_col2 = st.columns(2)
+    
+    with p_col1:
+        st.markdown("#### 1-Hour Chart (50 EMA Trend Barrier)")
+        df_1h_plot = df_1h_calc.tail(120)
+        fig_1h, ax_1h = plt.subplots(figsize=(8, 4.5))
+        ax_1h.plot(df_1h_plot.index, df_1h_plot['Close'], label='1H Close', color='black', linewidth=1.2)
+        ax_1h.plot(df_1h_plot.index, df_1h_plot['EMA50'], label='1H EMA 50', color='blue', linewidth=1.5)
+        ax_1h.axhline(latest_1h_ema, color='blue', linestyle='--', alpha=0.7, label=f"1H Barrier ${latest_1h_ema:,.2f}")
+        ax_1h.axhline(live_spot, color='orange', linestyle=':', label=f"Spot ${live_spot:,.2f}")
+        ax_1h.xaxis.set_major_formatter(mdates.DateFormatter('%b %d'))
+        ax_1h.legend(loc='upper left')
+        ax_1h.grid(alpha=0.25)
+        st.pyplot(fig_1h)
+        
+    with p_col2:
+        st.markdown("#### 4-Hour Chart (Macro 50 EMA Macro Barrier)")
+        df_4h_plot = df_4h_calc.tail(80)
+        fig_4h, ax_4h = plt.subplots(figsize=(8, 4.5))
+        ax_4h.plot(df_4h_plot.index, df_4h_plot['Close'], label='4H Close', color='black', linewidth=1.2)
+        ax_4h.plot(df_4h_plot.index, df_4h_plot['EMA50'], label='4H EMA 50', color='red', linewidth=1.5)
+        ax_4h.axhline(latest_4h_ema, color='red', linestyle='--', alpha=0.7, label=f"4H Barrier ${latest_4h_ema:,.2f}")
+        ax_4h.axhline(live_spot, color='orange', linestyle=':', label=f"Spot ${live_spot:,.2f}")
+        ax_4h.xaxis.set_major_formatter(mdates.DateFormatter('%b %d'))
+        ax_4h.legend(loc='upper left')
+        ax_4h.grid(alpha=0.25)
+        st.pyplot(fig_4h)
 
 # --- AUTO-REFRESH KEEPALIVE ENGINE ---
 if auto_refresh:
